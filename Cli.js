@@ -15,6 +15,16 @@
 // original issue text and in upstream source did NOT hold up and are
 // called out inline; this file reflects what was actually observed.
 //
+// DATABASE OVERRIDE (issue #17): listArgv()/showArgv() both take an
+// optional `database` argument and thread it into `-d/--database <value>`
+// via the shared _withDatabase() helper below. This was previously a
+// documented-but-inert shell.json setting (issue #8) that Backend.qml never
+// read; #17 is what actually wires it end to end. See _withDatabase()'s own
+// doc comment for the empty-means-unchanged invariant and for why this file
+// deliberately does not try to distinguish a path from a
+// --list-databases-printed name -- otpclient-cli's own -d/--database
+// accepts either, unchanged.
+//
 // Field names, confirmed against the real binary's --output=json:
 //   --list  -> array of {issuer, account, group, type}
 //   --show  -> array (always observed array-wrapped, even for one result)
@@ -144,8 +154,32 @@ function isPathLookupCandidate(candidate) {
   return typeof candidate === "string" && candidate.length > 0 && candidate.charAt(0) !== "/"
 }
 
-function listArgv() {
-  return ["--list", "--output=json"]
+// Prepends `-d/--database <value>` (issue #17: threading PanelState's
+// `database` setting -- issue #8 -- down into the argv Cli.js builds), but
+// ONLY when a value is actually present. `database` falsy (undefined, null,
+// or "" -- the shell.json default) returns `argv` completely untouched: this
+// is what makes the common, unconfigured path byte-identical to the argv
+// this file built before this feature existed, which is the one invariant
+// every caller (listArgv()/showArgv() below) most needs to hold exactly.
+//
+// `otpclient-cli --help` documents -d/--database as accepting EITHER "a
+// path to the database" OR "a name from --list-databases" -- confirmed
+// against a real otpclient-cli 5.1.6 (see the PR description). This
+// function does not, and must not, try to tell those two apart (e.g. by
+// sniffing for a leading "/"): the flag itself doesn't care, so guessing
+// here would only be one more way to get it wrong for a name that happens
+// to look path-shaped (or vice versa). Whatever PanelState's `database`
+// setting holds is passed straight through, verbatim, as ITS OWN discrete
+// argv element -- never interpolated into `-d<value>` or any other single
+// string -- same invariant every other argv element in this file already
+// holds (see showArgv()'s own note on shell metacharacters).
+function _withDatabase(argv, database) {
+  if (!database) return argv
+  return ["--database", String(database)].concat(argv)
+}
+
+function listArgv(database) {
+  return _withDatabase(["--list", "--output=json"], database)
 }
 
 // --account is documented by `otpclient-cli --help` as mandatory for
@@ -158,11 +192,17 @@ function listArgv() {
 // before this is even called, and issuer is included only when present,
 // since every entry Backend has on hand -- from a prior --list -- carries
 // both fields already.)
-function showArgv(issuer, account) {
+//
+// `database` (issue #17) is threaded through identically to listArgv()
+// above, via the same _withDatabase() helper -- Backend.qml passes the
+// SAME `database` value to both builders from the SAME property on every
+// call, so --list and --show can never read two different databases just
+// because one call site forgot to pass it along.
+function showArgv(issuer, account, database) {
   var argv = ["--show", "-a", String(account)]
   if (issuer) argv.push("-i", String(issuer))
   argv.push("-m", "--output=json")
-  return argv
+  return _withDatabase(argv, database)
 }
 
 function isMissingExit(exitCode) {

@@ -241,6 +241,78 @@ Item {
     onListSucceeded: function () { root.check("malformed: must not succeed", false); root.runNext() }
   }
 
+  // ---- Scenario: database setting reaches EVERY call site consistently
+  // (issue #17) -- listInventory(), requestCode(), and requestHotpCode()
+  // must all pass the SAME `database` value into the SAME -d/--database
+  // argv element. tests/fixtures/database-select.sh returns visibly
+  // DIFFERENT output ("FixtureDB"/"matched" vs. "DefaultDB"/"unmatched")
+  // depending on whether "--database /fixture/expected.db" is actually
+  // present in argv -- a fixture that answered identically either way
+  // would pass whether or not this feature was ever wired up, which is
+  // exactly the "test that passes around the bug" issue #17 warns against.
+  // See tests/cli.test.js for the pure-argv-shape half of this same
+  // guarantee (byte-identical argv when unset; a single discrete argv
+  // element, path or name, when set).
+  Backend {
+    id: databaseAppliedBackend
+    binaryCandidates: [root.fx("database-select.sh")]
+    timeoutMs: 3000
+    database: "/fixture/expected.db"
+    property int phase: 0
+    onListSucceeded: function (entries) {
+      root.check("database-applied: --list carries --database, entry matches the fixture db",
+        entries.length === 1 && entries[0].issuer === "FixtureDB" && entries[0].account === "matched")
+      databaseAppliedBackend.phase = 1
+      databaseAppliedBackend.requestCode("FixtureDB", "matched", "TOTP")
+    }
+    onListFailed: function (state, message) { root.check("database-applied: list must not fail (" + state + ")", false); root.runNext() }
+    onShowSucceeded: function (issuer, account, entry) {
+      if (databaseAppliedBackend.phase === 1) {
+        root.check("database-applied: requestCode() (TOTP path) also carries --database", entry.current === "555000")
+        databaseAppliedBackend.phase = 2
+        databaseAppliedBackend.requestHotpCode("FixtureDB", "matched")
+      } else {
+        root.check("database-applied: requestHotpCode() also carries --database -- inventory and reveal never disagree on which database they read", entry.current === "555000")
+        root.runNext()
+      }
+    }
+    onShowFailed: function (issuer, account, state, message) { root.check("database-applied: show must not fail (" + state + ")", false); root.runNext() }
+  }
+
+  // ---- Scenario: unset `database` (the default, "") must keep producing
+  // today's exact argv -- no --database flag at all -- across the SAME
+  // three call sites. Reuses the SAME fixture: it answers "DefaultDB"/
+  // "unmatched" whenever --database is absent, which is exactly what must
+  // happen here. This is the regression guard for the common,
+  // unconfigured path: if a future change started always passing
+  // --database (even an empty string, or some other unconditional value),
+  // this scenario -- not just tests/cli.test.js's pure argv check -- would
+  // catch it at the real Process/fixture level too.
+  Backend {
+    id: databaseUnsetBackend
+    binaryCandidates: [root.fx("database-select.sh")]
+    timeoutMs: 3000
+    property int phase: 0
+    onListSucceeded: function (entries) {
+      root.check("database-unset: --list carries no --database flag by default",
+        entries.length === 1 && entries[0].issuer === "DefaultDB" && entries[0].account === "unmatched")
+      databaseUnsetBackend.phase = 1
+      databaseUnsetBackend.requestCode("DefaultDB", "unmatched", "TOTP")
+    }
+    onListFailed: function (state, message) { root.check("database-unset: list must not fail (" + state + ")", false); root.runNext() }
+    onShowSucceeded: function (issuer, account, entry) {
+      if (databaseUnsetBackend.phase === 1) {
+        root.check("database-unset: requestCode() also carries no --database flag by default", entry.current === "000111")
+        databaseUnsetBackend.phase = 2
+        databaseUnsetBackend.requestHotpCode("DefaultDB", "unmatched")
+      } else {
+        root.check("database-unset: requestHotpCode() also carries no --database flag by default", entry.current === "000111")
+        root.runNext()
+      }
+    }
+    onShowFailed: function (issuer, account, state, message) { root.check("database-unset: show must not fail (" + state + ")", false); root.runNext() }
+  }
+
   // ---- Scenario: repeat call reuses the cached binary path, no re-probe ---
   Backend {
     id: cacheBackend
@@ -340,6 +412,8 @@ Item {
       function () { emptyShowBackend.requestCode("Nobody", "nobody", "TOTP") },
       function () { emptyListBackend.listInventory() },
       function () { malformedBackend.listInventory() },
+      function () { databaseAppliedBackend.listInventory() },
+      function () { databaseUnsetBackend.listInventory() },
       function () { cacheBackend.listInventory() },
       function () { pathLookupBackend.listInventory() },
       function () {

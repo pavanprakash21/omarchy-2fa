@@ -102,12 +102,17 @@ BarWidget {
   // mechanism and handed down as plain property bindings -- PanelState.qml
   // itself never touches shell.json (see its own "Settings (issue #8)"
   // section for each key's default/meaning). Minimal, additive change to
-  // this file only to pass these three straight through.
+  // this file only to pass these straight through.
+  //
+  // `database` (issue #17): now actually reaches Backend.qml/Cli.js via
+  // PanelState's own `database` alias -- previously accepted here and
+  // silently dropped (see PanelState.qml's doc comment on that property).
   PanelState {
     id: state
     maskRevealedCode: root.setting("maskCodes", true)
     revealSeconds: root.setting("revealSeconds", 5)
     clipboardClearSeconds: root.setting("clipboardClearSeconds", 0)
+    database: root.setting("database", "")
   }
 
   onOpenedChanged: {

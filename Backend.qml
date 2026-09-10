@@ -50,21 +50,26 @@ import "Shared.js" as Shared
 //   via Shared.js. See Shared.js and Cli.js's CONCURRENCY note for exactly
 //   what this does and doesn't protect against.
 //
-// PRECONDITION (discovered, not otherwise documented in issue #2): neither
-// argv this file builds includes -d/--database, matching the issue's exact
-// contract. `otpclient-cli --help` says -d "Default value is taken from
+// PRECONDITION (discovered, not otherwise documented in issue #2; UPDATED
+// for issue #17): the argv this file builds includes -d/--database ONLY
+// when `database` below is non-empty -- see that property's own doc
+// comment and Cli.js's _withDatabase(). With `database` left at its default
+// ("", unset), this is unchanged from the original issue #2 contract:
+// `otpclient-cli --help` says -d "Default value is taken from
 // GSettings/otpclient.cfg" -- confirmed: on a machine with no such default
 // set (e.g. otpclient-cli never configured via the GUI, as on the machine
 // this was developed on), --list with no -d prompts *interactively for a
 // database path* ("Type the absolute path to the database:") over stdin,
 // which hangs exactly like the password prompt under the same conditions
 // and is caught the same way, landing in `would-prompt`. In other words:
-// this widget assumes the user already has OTPClient set up with a default
-// database (GUI or `otpclient-cli --import`, which registers one) -- a
-// perfectly reasonable assumption for this plugin's premise, but worth
+// a user who leaves `database` unset still needs OTPClient set up with a
+// default database (GUI or `otpclient-cli --import`, which registers one)
+// -- a perfectly reasonable assumption for this plugin's premise, but worth
 // confirming with whoever owns settings/onboarding for this plugin, since
 // "no default database configured yet" is indistinguishable here from
-// "Secret Service is off", both being would-prompt.
+// "Secret Service is off", both being would-prompt. Setting `database`
+// explicitly sidesteps this precondition entirely, since -d is then always
+// present and otpclient-cli never falls back to the interactive prompt.
 //
 // THE DATABASE LOCK FILE (corrected after adversarial review -- the
 // original comment here was wrong): otpclient-cli creates a `<name>.lock`
@@ -97,6 +102,25 @@ Item {
   // machine while still failing fast into `would-prompt` when Secret
   // Service is off and the CLI is blocked reading a password from stdin.
   property int timeoutMs: 4000
+
+  // Optional otpclient-cli database override -- shell.json's `database`
+  // setting (issue #8), wired end to end here (issue #17). "" (the
+  // default) means exactly what it always has: no -d/--database argument
+  // at all, so otpclient-cli falls back to its own configured default --
+  // see Cli.js's _withDatabase() and the PRECONDITION note above this
+  // Item. Threaded into listInventory()/_requestShow() below via the
+  // SAME property read at each call site, so listInventory() and both
+  // requestCode()/requestHotpCode() (which share _requestShow()) can never
+  // disagree about which database they're reading -- a mismatch there
+  // would mean the inventory a user sees and the code a click on a row
+  // actually decrypts could silently come from two different databases,
+  // which is the one thing #17 explicitly calls out as unacceptable.
+  // otpclient-cli's own -d/--database accepts EITHER a path or a bare name
+  // as printed by --list-databases (confirmed via `otpclient-cli --help`);
+  // this property (and Cli.js) makes no attempt to tell the two apart --
+  // whatever a user configures is passed straight through as one argv
+  // element, never interpolated into anything else.
+  property string database: ""
 
   // ---- Read-only state --------------------------------------------------
 
@@ -164,7 +188,7 @@ Item {
     if (!root._begin("list")) return false
     listProc._issuer = ""
     listProc._account = ""
-    root._startAttempt(listProc, Cli.listArgv(), 0)
+    root._startAttempt(listProc, Cli.listArgv(root.database), 0)
     return true
   }
 
@@ -237,7 +261,7 @@ Item {
     if (!root._begin("show")) return false
     showProc._issuer = String(issuer || "")
     showProc._account = String(account)
-    root._startAttempt(showProc, Cli.showArgv(showProc._issuer, showProc._account), 0)
+    root._startAttempt(showProc, Cli.showArgv(showProc._issuer, showProc._account, root.database), 0)
     return true
   }
 

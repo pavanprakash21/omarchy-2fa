@@ -32,6 +32,22 @@ Item {
   readonly property var entries: backend.entries
   readonly property bool busy: backend.busy
 
+  // Optional otpclient-cli database override -- shell.json's `database`
+  // setting (issue #8), wired end to end to Backend.qml here (issue #17).
+  // Aliased straight onto Backend's own `database` property rather than
+  // copied onto a second plain property: unlike clipboardClearSeconds/
+  // maskRevealedCode/revealSeconds/confirmHotp below, PanelState has no
+  // logic of its own to apply to this value -- it is pure pass-through --
+  // and the ONE Backend instance below already serves listInventory() and
+  // both requestCode()/requestHotpCode() from this SAME property (see
+  // Backend.qml's own `database` doc comment for why that matters). An
+  // alias can't drift out of sync with Backend's value the way a copied
+  // property could if a future change forgot to keep them assigned
+  // together. "" (the default) means exactly what it always has: no
+  // -d/--database argument at all, today's existing default-database
+  // behavior, completely unchanged.
+  property alias database: backend.database
+
   // ---- External tool paths (overridable for tests) -----------------------
   property string wlCopyPath: "/usr/bin/wl-copy"
   property string wlPastePath: "/usr/bin/wl-paste"
