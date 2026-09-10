@@ -62,8 +62,17 @@ BarWidget {
 
   // Panel state/logic (issues #4/#5) -- see PanelState.qml's own docstring
   // for why this is a plain Item and not part of this file or Popup.qml.
+  //
+  // Issue #8 settings, read through the base class's setting()/shell.json
+  // mechanism and handed down as plain property bindings -- PanelState.qml
+  // itself never touches shell.json (see its own "Settings (issue #8)"
+  // section for each key's default/meaning). Minimal, additive change to
+  // this file only to pass these three straight through.
   PanelState {
     id: state
+    maskRevealedCode: root.setting("maskCodes", true)
+    revealSeconds: root.setting("revealSeconds", 5)
+    clipboardClearSeconds: root.setting("clipboardClearSeconds", 0)
   }
 
   onOpenedChanged: {
@@ -83,7 +92,9 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰦝"
+    // Issue #8's `icon` setting overrides the bar glyph. Default matches
+    // this widget's original hard-coded glyph exactly.
+    text: root.setting("icon", "󰦝")
     fontSize: Style.font.icon
     foreground: root.iconColor
     tooltipText: "2FA"

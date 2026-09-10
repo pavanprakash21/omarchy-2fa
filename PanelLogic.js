@@ -138,6 +138,78 @@ function revealStatusText(type, clipboardCopyState, secondsRemaining, isFallback
   return typeLabel + " code copied · " + countdownPhrase
 }
 
+// Maps a Backend-reported typed state (see Backend.qml's listFailed/
+// showFailed docstring: binary-missing, would-prompt, bad-password,
+// db-missing, malformed, empty, crashed, instance-conflict -- plus this
+// panel's own synthetic "busy" for a call refused because another is
+// already in flight) to a message that NAMES THE FIX, not the symptom --
+// issue #6's core requirement. Backend/Cli.js's own messages are written
+// for a developer reading a log (exit codes, elapsed-ms, raw stderr
+// fragments); none of them tell a user what to actually go and do.
+//
+// Every branch below is a fixed, static string -- this function never
+// echoes `fallbackMessage` (Backend/Cli.js's own text) except for the one
+// `default` case of a state this function doesn't recognize at all. That's
+// deliberate, not just tidy: issue #6 requires that no error message ever
+// echo a password, a code, or a database secret, and Cli.js's own messages,
+// while reviewed to avoid that today, are a moving part this file doesn't
+// own (see the "consume, do not modify" note on Backend.qml/Cli.js) --
+// hard-coding this panel's copy per typed STATE rather than laundering
+// Backend's own MESSAGE text through here means a future change to
+// Backend/Cli.js's wording can never leak something sensitive into this
+// panel without also changing the typed state string itself, which is
+// reviewed and tested independently (tests/backend.qmltest.qml).
+//
+// `context` is "list" or "show" -- the two callers, Popup.qml's panel-wide
+// load-error banner and a single row's reveal-error text. Only `empty`
+// actually differs by context: a --list with zero rows is issue #6's own
+// neutral "empty database" state (rendered separately by Popup.qml's
+// loadState === "empty" branch, which never calls this function at all --
+// see there); a --show with an empty result means the specific account
+// this row named didn't resolve anymore, which is a much rarer, narrower
+// thing to explain.
+function degradedStateMessage(state, context, fallbackMessage) {
+  switch (state) {
+    case "binary-missing":
+      return "otpclient isn't installed. It's AUR-only (not in extra) -- " +
+        "install it with: yay -S otpclient, then reopen this panel."
+    case "would-prompt":
+      return "OTPClient's Secret Service integration is off, so otpclient-cli " +
+        "is waiting on a password prompt this panel can never answer. Open " +
+        "OTPClient -> Preferences and enable \"Use Secret Service\" so the " +
+        "keyring supplies the password automatically."
+    case "bad-password":
+      return "The password OTPClient has stored for this database is stale " +
+        "or wrong. Unlock the database once in the OTPClient GUI to refresh " +
+        "it in the keyring."
+    case "db-missing":
+      return "No OTPClient database found at the configured path. Set one up " +
+        "in the OTPClient GUI, or check the path in " +
+        "~/.config/otpclient/otpclient.cfg."
+    case "malformed":
+      return "otpclient-cli returned output this panel could not understand. " +
+        "Reported as-is -- no automatic repair is attempted, since that could " +
+        "touch your database."
+    case "crashed":
+      return "otpclient-cli crashed. This looks like a bug in otpclient-cli " +
+        "or a damaged database, not something wrong with this panel's own " +
+        "configuration -- try running otpclient-cli --list in a terminal for " +
+        "more detail."
+    case "instance-conflict":
+      return "otpclient-cli couldn't run because another OTPClient process " +
+        "already has the database open -- most commonly the OTPClient GUI " +
+        "itself. Close it and try again."
+    case "busy":
+      return "Busy -- try again in a moment."
+    case "empty":
+      return context === "show"
+        ? "No matching entry for this account anymore. Close and reopen the panel to refresh the list."
+        : "No entries in your OTPClient database."
+    default:
+      return String(fallbackMessage || "Couldn't complete the request.")
+  }
+}
+
 // The armed-confirmation prompt for a row gated by requiresConfirmation().
 // Only names the HOTP counter-advance consequence when the type is
 // affirmatively HOTP -- an unrecognized type (the same deny-list edge case

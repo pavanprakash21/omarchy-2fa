@@ -36,28 +36,57 @@ Item {
   property string wlCopyPath: "/usr/bin/wl-copy"
   property string wlPastePath: "/usr/bin/wl-paste"
 
-  // ---- Forward-compatible hooks for #8 (settings), not otherwise wired
-  // to anything persisted from this issue set -----------------------------
+  // ---- Settings (issue #8) -- wired here, read via Widget.qml's
+  // BarWidget.setting("<key>", <fallback>) and handed down onto these
+  // plain properties; PanelState itself never touches shell.json. ---------
+
   // <= 0 disables the optional post-copy clipboard-clear timer.
+  // shell.json key: clipboardClearSeconds, default 0 (disabled).
   property int clipboardClearSeconds: 0
+
   // Conceals the on-screen code for a reveal; a copy to the clipboard
   // still ALWAYS happens regardless of this (see onShowSucceeded below --
   // adversarial review found an earlier version had this backwards,
   // suppressing the copy instead of the on-screen paint, which is the
-  // opposite of "safe to have open on a shared screen"). Defaults false:
-  // issue #5's default reveal behavior is to show what was just copied.
-  // #8 owns wiring this to a persisted "maskCodes" setting; the masked
-  // code is still revealable on screen via the explicit unmaskRevealedCode()
-  // action below, since #8's whole point is a default, not a one-way lock.
-  property bool maskRevealedCode: false
+  // opposite of "safe to have open on a shared screen"). shell.json key:
+  // maskCodes, default true (issue #8) -- SUPERSEDES issue #5's original
+  // "show what was just copied" default: #8 explicitly documents maskCodes'
+  // default as true, so a masked-until-clicked reveal is now this plugin's
+  // out-of-the-box behavior, on the theory that a 2FA code is exactly the
+  // kind of thing that shouldn't paint in plaintext on a shared screen by
+  // default. The masked code is still revealable on screen via the explicit
+  // unmaskRevealedCode() action below -- this is a default, not a one-way
+  // lock -- and the never-suppress-the-copy invariant above is untouched by
+  // this default change.
+  property bool maskRevealedCode: true
 
-  // otpclient-cli never reports validity_seconds for HOTP (there is no
-  // period to count down -- verified against a real database, see Cli.js's
-  // module docstring) so `entry.secondsRemaining` comes back -1. This is a
-  // fixed fallback window purely for this UI's own "don't leave a
-  // decrypted code on screen forever" backstop -- not information from
-  // otpclient-cli.
-  readonly property int hotpRevealFallbackSeconds: 30
+  // How long a reveal stays on screen before auto-clearing, for whichever
+  // case otpclient-cli itself gives no expiry to count down at all --
+  // always true for HOTP (there is no period, only a counter -- verified
+  // against a real database, see Cli.js's module docstring), and also true
+  // for any entry whose type isn't affirmatively "TOTP" (see
+  // PanelLogic.isDefinitivelyTotp()). shell.json key: revealSeconds,
+  // default 5 (issue #8). Deliberately does NOT shorten or extend a REAL
+  // CLI-reported TOTP expiry (entry.secondsRemaining) -- see
+  // onShowSucceeded below: overriding an honest, already-reviewed
+  // "seconds remaining" readout with an unrelated user preference would
+  // make the countdown lie about how long the code is actually valid for,
+  // which is exactly the failure mode issue #5's adversarial review
+  // already steered this file away from once (see revealCountdownIsFallback's
+  // own docstring). This is purely this UI's own "don't leave a decrypted
+  // code on screen forever" backstop, same role the old, no-longer-settable
+  // hotpRevealFallbackSeconds constant (30) used to play.
+  property int revealSeconds: 5
+
+  // Whether the HOTP confirm gate (activateSelected()'s requiresConfirmation()
+  // check below) can be relaxed by configuration. shell.json key:
+  // confirmHotp, default true. DELIBERATELY INERT even when set to `false`:
+  // see activateSelected()'s own docstring for why a setting is never
+  // allowed to turn this gate fail-open. Kept as a real, readable property
+  // (rather than not accepting the key at all) purely so a shell.json entry
+  // for it doesn't silently vanish with zero trace of having been read --
+  // but it has no effect on behavior. Exposed for introspection/tests only.
+  property bool confirmHotp: true
 
   // ---- Inventory / search / selection -------------------------------------
   property string filterText: ""
@@ -90,6 +119,23 @@ Item {
   // layer up, at the UI's own state.
   property var revealedEntry: null
   property string revealErrorMessage: ""
+  // The typed state (see Backend.qml's showFailed docstring: bad-password,
+  // db-missing, malformed, would-prompt, crashed, instance-conflict,
+  // binary-missing, empty -- or this file's own synthetic "busy") behind
+  // the LAST reveal failure, kept separately from revealErrorMessage so
+  // Popup.qml (issue #6) can map it through PanelLogic.degradedStateMessage()
+  // for an actionable, fix-naming message instead of rendering whatever raw
+  // text Backend/Cli.js happened to produce for a log reader.
+  property string revealErrorState: ""
+  // issuer+account key (Logic.entryKey shape) of the row a reveal failure
+  // belongs to, so Popup.qml can show the error on THAT row specifically --
+  // mirrors _pendingKey/revealedEntry's own per-row addressing. Cleared by
+  // clearReveal() and by _syncRevealToSelection() the moment the selection
+  // moves off of it, same discipline as every other per-row reveal field
+  // here (see that function's own docstring for why an explicit call at
+  // every selection-changing site, not just onSelectedIndexChanged, is
+  // required).
+  property string revealFailedKey: ""
   property string _pendingKey: ""
 
   // Whether the CURRENTLY revealed code's on-screen display is concealed
@@ -102,7 +148,7 @@ Item {
   property bool codeMaskedOnScreen: false
 
   // True when the current reveal's countdown is THIS UI's own fabricated
-  // auto-clear window (hotpRevealFallbackSeconds), not a real CLI-reported
+  // auto-clear window (revealSeconds), not a real CLI-reported
   // expiry (TOTP's validity_seconds). Computed from whether the CLI
   // actually reported one (entry.secondsRemaining >= 0), not from the
   // entry's `type` string -- deliberately data-driven rather than
@@ -142,6 +188,18 @@ Item {
       && root.revealedEntry.issuer === issuer && root.revealedEntry.account === account
   }
 
+  // Whether the LAST reveal failure (see revealErrorState/revealFailedKey's
+  // own docstrings) belongs to this row -- issue #6's "errors are surfaced
+  // in-panel" for a reveal-time failure specifically (bad-password,
+  // db-missing, malformed, would-prompt, crashed, instance-conflict,
+  // binary-missing, or a same-row "no matching entry anymore" empty),
+  // distinct from a --list-time failure (root.loadState === "error", shown
+  // panel-wide since there's no row list to attach it to yet).
+  function isRevealFailedFor(issuer, account) {
+    return root.revealState === "error" && root.revealFailedKey !== ""
+      && root.revealFailedKey === root._keyFor(issuer, account)
+  }
+
   // Explicit "show me anyway" action for a masked reveal (maskRevealedCode
   // -- #8). The clipboard copy already happened unconditionally when the
   // reveal succeeded (see onShowSucceeded) -- this only affects the
@@ -169,6 +227,16 @@ Item {
   //     numerically UNCHANGED but now denotes a completely different
   //     entry, because the list underneath it narrowed -- a plain
   //     onSelectedIndexChanged handler would miss exactly that case.
+  //   - backend's onListSucceeded (a manual refresh() via Popup.qml's
+  //     refresh button, NOT just open()'s own reset-to--1-then-refresh
+  //     path) re-clamps selectedIndex the exact same way, and is exactly as
+  //     capable of leaving the NUMBER unchanged while the underlying
+  //     inventory reordered underneath it -- e.g. the user edited tokens in
+  //     the OTPClient GUI while this panel happened to be open. Found by a
+  //     second review pass after the moveSelection()/click-path fix above
+  //     had already landed: same bug class, third call site. onListSucceeded
+  //     now calls this explicitly too, for the same reason setFilterText()
+  //     already had to.
   //
   // Reads Logic.entryAt(filteredEntries, selectedIndex) directly rather
   // than the selectedEntry convenience property -- confirmed empirically
@@ -189,7 +257,9 @@ Item {
 
     var revealKey = root.revealedEntry ? Logic.entryKey(root.revealedEntry) : ""
     var pendingKey = root._pendingKey
-    if ((revealKey !== "" && revealKey !== key) || (pendingKey !== "" && pendingKey !== key)) {
+    var failedKey = root.revealFailedKey
+    if ((revealKey !== "" && revealKey !== key) || (pendingKey !== "" && pendingKey !== key)
+        || (failedKey !== "" && failedKey !== key)) {
       root.clearReveal()
     }
   }
@@ -275,6 +345,16 @@ Item {
   // a real counter. requiresConfirmation() is true for anything that
   // isn't affirmatively, definitely TOTP, so the unknown case is treated
   // as needing confirmation rather than being silently allowed through.
+  //
+  // Issue #8 lists a `confirmHotp` setting (see the `confirmHotp` property
+  // above) alongside this gate. Deliberately NOT read here: Logic.
+  // requiresConfirmation() takes only `entry.type`, never root.confirmHotp,
+  // so there is no way for a shell.json entry to relax this DENY-list back
+  // into the ALLOW-list the paragraph above already had to fix once. A
+  // setting is a preference; this gate exists because --show is a
+  // real-world, non-idempotent, persisted mutation of an HOTP counter, and
+  // "the user configured it away" is not a safe way for that protection to
+  // go missing.
   function activateSelected() {
     var entry = root.selectedEntry
     if (!entry) return false
@@ -307,13 +387,16 @@ Item {
   function _requestReveal(entry, viaHotpPath) {
     root.clearReveal()
     root.revealState = "loading"
-    root._pendingKey = root._keyFor(entry.issuer, entry.account)
+    var key = root._keyFor(entry.issuer, entry.account)
+    root._pendingKey = key
     var ok = viaHotpPath
       ? backend.requestHotpCode(entry.issuer, entry.account)
       : backend.requestCode(entry.issuer, entry.account, entry.type)
     if (!ok) {
       root.revealState = "error"
+      root.revealErrorState = "busy"
       root.revealErrorMessage = "Busy -- try again in a moment."
+      root.revealFailedKey = key
       root._pendingKey = ""
     }
     return ok
@@ -329,6 +412,8 @@ Item {
     root.revealState = "idle"
     root.revealedEntry = null
     root.revealErrorMessage = ""
+    root.revealErrorState = ""
+    root.revealFailedKey = ""
     root._pendingKey = ""
     root.codeMaskedOnScreen = false
     root.revealCountdownIsFallback = false
@@ -346,6 +431,19 @@ Item {
       root.loadErrorState = ""
       root.loadErrorMessage = ""
       root.selectedIndex = Logic.clampIndex(root.selectedIndex >= 0 ? root.selectedIndex : 0, root.filteredEntries.length)
+      // Explicit call, not just reliance on onSelectedIndexChanged: a
+      // refresh() (Popup.qml's refresh button calls this directly, not
+      // open(), which resets selectedIndex to -1 first) can re-clamp
+      // selectedIndex onto the SAME numeric value while the inventory
+      // order underneath it changed -- e.g. the user edited tokens in the
+      // OTPClient GUI while this panel was open. onSelectedIndexChanged
+      // never fires when the number doesn't change, so without this a
+      // stale reveal for the OLD entry at that index would survive a
+      // refresh that just handed selectedIndex a completely different one.
+      // Same class of bug _syncRevealToSelection()'s own docstring already
+      // covers for moveSelection()/the row-click path/setFilterText(); this
+      // is the third call site it has to be wired into explicitly.
+      root._syncRevealToSelection()
     }
     onListFailed: function (state, message) {
       root.loadState = state === "empty" ? "empty" : "error"
@@ -358,10 +456,10 @@ Item {
       root._pendingKey = ""
       root.revealErrorMessage = ""
       // entry.secondsRemaining is -1 whenever the CLI didn't report one at
-      // all (always true for HOTP -- see hotpRevealFallbackSeconds's own
-      // docstring). Recorded BEFORE normalizing it below, since that's the
-      // one moment this function can still tell a real CLI-reported expiry
-      // apart from this UI's own fabricated auto-clear window (see
+      // all (always true for HOTP -- see revealSeconds's own docstring).
+      // Recorded BEFORE normalizing it below, since that's the one moment
+      // this function can still tell a real CLI-reported expiry apart from
+      // this UI's own fabricated auto-clear window (see
       // revealCountdownIsFallback's docstring -- adversarial review found
       // Popup.qml rendering both identically, which tells the user an HOTP
       // code is "expiring" on a clock it doesn't have).
@@ -371,7 +469,7 @@ Item {
       // first countdownTimer tick a full second later papers over it --
       // otherwise a caller reading revealedEntry.secondsRemaining in that
       // first second (Popup.qml's own binding included) would show "-1s".
-      var initial = Math.max(1, isFallback ? root.hotpRevealFallbackSeconds : entry.secondsRemaining)
+      var initial = Math.max(1, isFallback ? root.revealSeconds : entry.secondsRemaining)
       var normalized = {}
       for (var k in entry) normalized[k] = entry[k]
       normalized.secondsRemaining = initial
@@ -391,7 +489,9 @@ Item {
       if (root._keyFor(issuer, account) !== root._pendingKey) return
       root._pendingKey = ""
       root.revealState = "error"
+      root.revealErrorState = state
       root.revealErrorMessage = message
+      root.revealFailedKey = root._keyFor(issuer, account)
       root.revealedEntry = null
     }
   }
