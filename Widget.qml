@@ -18,7 +18,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "🔐"
+    text: "󰦝"
     fontSize: Style.font.icon
     tooltipText: "2FA (coming soon)"
     interactive: false
