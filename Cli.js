@@ -117,16 +117,26 @@ function timeoutSeconds(timeoutMs) {
   return Math.max(1, Math.ceil(timeoutMs / 1000))
 }
 
+// Wraps ANY argv array in `timeout -s KILL <n>` -- the one, shared
+// implementation of the OS-level deadline every subprocess this plugin
+// spawns is held to. -s KILL (SIGKILL) is required rather than the default
+// SIGTERM: otpclient-cli blocked reading a password from stdin (confirmed:
+// it blocks rather than failing fast, when stdin is an open pipe with no
+// writer and no data -- exactly what Quickshell's Process gives a child by
+// default) may not react to TERM, and SIGKILL cannot be caught or ignored.
+// wrap()/wrapViaPath() below are otpclient-cli-specific callers of this;
+// GuardedProcess.qml (issue #20 -- PanelState.qml's wl-copy/wl-paste
+// processes) is the other, calling this directly rather than duplicating
+// the wrapping logic a second time.
+function wrapTimeout(argv, timeoutMs) {
+  return [TIMEOUT_BIN, "-s", "KILL", String(timeoutSeconds(timeoutMs))].concat(argv)
+}
+
 // Wrap the real invocation in `timeout -s KILL <n>`. This is a second,
 // OS-enforced deadline on top of the QML-side watchdog timer in Backend.qml
-// -- belt and suspenders, mirroring zeru.portwatch's Widget.qml. -s KILL
-// (SIGKILL) is required rather than the default SIGTERM: otpclient-cli
-// blocked reading a password from stdin (confirmed: it blocks rather than
-// failing fast, when stdin is an open pipe with no writer and no data --
-// exactly what Quickshell's Process gives a child by default) may not
-// react to TERM, and SIGKILL cannot be caught or ignored.
+// -- belt and suspenders, mirroring zeru.portwatch's Widget.qml.
 function wrap(binaryPath, argvTail, timeoutMs) {
-  return [TIMEOUT_BIN, "-s", "KILL", String(timeoutSeconds(timeoutMs)), binaryPath].concat(argvTail)
+  return wrapTimeout([binaryPath].concat(argvTail), timeoutMs)
 }
 
 // Absolute-path fallback: `env` resolves its first argument through PATH
@@ -144,7 +154,7 @@ function wrap(binaryPath, argvTail, timeoutMs) {
 var PATH_LOOKUP_BIN = "/usr/bin/env"
 
 function wrapViaPath(name, argvTail, timeoutMs) {
-  return [TIMEOUT_BIN, "-s", "KILL", String(timeoutSeconds(timeoutMs)), PATH_LOOKUP_BIN, name].concat(argvTail)
+  return wrapTimeout([PATH_LOOKUP_BIN, name].concat(argvTail), timeoutMs)
 }
 
 // A `binaryCandidates` entry is a request to resolve via PATH (rather than

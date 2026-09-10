@@ -188,6 +188,37 @@ test("wrapViaPath resolves through /usr/bin/env with the exact candidate name, s
   assertEqual(cmd, ["/usr/bin/timeout", "-s", "KILL", "4", "/usr/bin/env", "otpclient-cli", "--list", "--output=json"]);
 });
 
+test("wrapTimeout is the exact shared primitive wrap()/wrapViaPath() are built from", () => {
+  assertEqual(Cli.wrapTimeout(["/bin/foo", "-x"], 4000), ["/usr/bin/timeout", "-s", "KILL", "4", "/bin/foo", "-x"]);
+});
+
+// ---- issue #21: Backend.qml's default binaryCandidates must not include a
+// PATH-lookup fallback -- this project's own README documents exactly one
+// supported install method (AUR, landing at /usr/bin), so a bare-name
+// default candidate resolved via PATH (see wrapViaPath()/
+// isPathLookupCandidate() above) was pure attack surface under this
+// project's own threat model (issue #9: "a compromised or substituted
+// otpclient-cli ... binary on a poisoned PATH") with no corresponding,
+// documented use case. The mechanism itself is intentionally NOT deleted
+// (still real, tested infrastructure for an explicit, future opt-in --
+// see tests/backend.qmltest.qml's "path-lookup" scenario, which overrides
+// binaryCandidates directly rather than relying on this default) -- only
+// the default's silent inclusion of it is what issue #21 requires gone.
+// A plain source-text check, not a QML-runtime one: Backend.qml's
+// `property var` default is right there in the file as a JS array literal.
+test("Backend.qml's default binaryCandidates has no bare (PATH-lookup) candidate", () => {
+  const backendPath = path.join(__dirname, "..", "Backend.qml");
+  const backendSrc = fs.readFileSync(backendPath, "utf8");
+  const m = backendSrc.match(/property var binaryCandidates:\s*(\[[^\]]*\])/);
+  assert(m, "could not find Backend.qml's binaryCandidates property declaration");
+  const candidates = JSON.parse(m[1].replace(/'/g, '"'));
+  assert(candidates.length > 0, "binaryCandidates default must not be empty");
+  candidates.forEach((c) => {
+    assert(!Cli.isPathLookupCandidate(c),
+      "Backend.qml's default binaryCandidates still contains a bare PATH-lookup candidate: " + c);
+  });
+});
+
 // ---- exit-code classification ------------------------------------------
 // NOTE: exit codes turned out NOT to reliably discriminate outcomes against
 // the real binary (wrong password, missing db, and a bad password-file
@@ -375,6 +406,23 @@ test("unparseable stdout with no recognized stderr -> malformed, never throws", 
 test("classify never throws on totally empty input", () => {
   const r = Cli.classify(1, "", "", "show");
   assertEqual(r.state, "malformed");
+});
+
+// ---- issue #22: no untrusted (issuer/account) content reaches a log sink --
+// requestCode()'s HOTP-misuse console.warn() used to interpolate issuer/
+// account -- untrusted, otpauth://-import-derived strings -- straight into
+// a log line. A plain source-text check: confirms the ONE console.* call
+// in this plugin's otpclient-facing surface (verified separately, by
+// `grep -rn "console\." --include=*.qml --include=*.js .`, to be the only
+// one outside tests/) does not reference either variable.
+test("Backend.qml's HOTP-refusal console.warn does not interpolate issuer/account", () => {
+  const backendPath = path.join(__dirname, "..", "Backend.qml");
+  const backendSrc = fs.readFileSync(backendPath, "utf8");
+  const m = backendSrc.match(/console\.warn\(([^\n]*)\)/);
+  assert(m, "could not find the console.warn(...) call in Backend.qml");
+  const warnArgs = m[1];
+  assert(!/\bissuer\b/.test(warnArgs), "console.warn still references `issuer` -- untrusted content reaching a log sink (issue #22)");
+  assert(!/\baccount\b/.test(warnArgs), "console.warn still references `account` -- untrusted content reaching a log sink (issue #22)");
 });
 
 // ---- report ---------------------------------------------------------

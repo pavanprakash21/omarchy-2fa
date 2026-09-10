@@ -23,6 +23,17 @@ import "PanelLogic.js" as Logic
 // can spawn (otpclient-cli via Backend, wl-copy, wl-paste) at a fixture
 // script instead of the real thing, so a test run never touches this
 // machine's real OTPClient database or its real Wayland clipboard.
+//
+// Every one of THIS file's own subprocesses -- copyProc/pasteProc/
+// clearCopyProc, below -- is a GuardedProcess (see GuardedProcess.qml), not
+// a raw Quickshell.Io.Process. Issue #20 found that this file's clipboard
+// machinery had none of Backend.qml's timeout+watchdog discipline, and
+// that this was the FOURTH time a "decrypted code outlives its intended
+// window" bug had turned up here at a newly added call site (see
+// GuardedProcess.qml's own header for the first three). GuardedProcess
+// exists specifically so that discipline is no longer something a new call
+// site can forget -- it's what spawning a subprocess in this file even
+// means now.
 Item {
   id: root
 
@@ -51,6 +62,17 @@ Item {
   // ---- External tool paths (overridable for tests) -----------------------
   property string wlCopyPath: "/usr/bin/wl-copy"
   property string wlPastePath: "/usr/bin/wl-paste"
+
+  // Hard wall-clock ceiling, in milliseconds, for EACH of the three
+  // clipboard processes below (copyProc/pasteProc/clearCopyProc) -- see
+  // GuardedProcess.qml, which is what actually spawns them and what this
+  // property really configures (mirrors Backend.qml's own timeoutMs).
+  // These are meant to be near-instantaneous local Wayland IPC calls, not
+  // anything that talks to a network or blocks on a password prompt, so
+  // 4000ms leaves generous headroom while still bounding a wedged
+  // compositor interaction or a substituted binary that just sits there
+  // forever (issue #20). Overridable for tests, same as timeoutMs.
+  property int clipboardTimeoutMs: 4000
 
   // ---- Settings (issue #8) -- wired here, read via Widget.qml's
   // BarWidget.setting("<key>", <fallback>) and handed down onto these
@@ -425,6 +447,20 @@ Item {
   function clearReveal() {
     countdownTimer.stop()
     clipboardClearTimer.stop()
+    // Issue #20: clearReveal() must be AUTHORITATIVE over every clipboard
+    // process this file owns, not just the on-screen/Timer state above --
+    // a reveal that's already been dropped can never leave a stale
+    // plaintext code sitting in a GuardedProcess's `secret` waiting on an
+    // in-flight (or hung) wl-copy/wl-paste to get around to clearing it
+    // itself. GuardedProcess.stop() force-stops the process (a no-op if it
+    // isn't running) and unconditionally blanks `secret` -- see its own
+    // doc comment. Stopping copyProc here too (not just pasteProc/
+    // clearCopyProc) is deliberate, for orphan-safety/consistency: a copy
+    // that's still in flight for a reveal that's being cleared right now
+    // has nothing useful left to finish anyway.
+    copyProc.stop()
+    pasteProc.stop()
+    clearCopyProc.stop()
     root.revealState = "idle"
     root.revealedEntry = null
     root.revealErrorMessage = ""
@@ -572,8 +608,8 @@ Item {
     root.clipboardCopyError = ""
     copyProc._started = false
     copyProc._finished = false
-    copyProc.command = [root.wlCopyPath]
-    copyProc._payload = code
+    copyProc.argv = [root.wlCopyPath]
+    copyProc.secret = code
     copyProc.stdinEnabled = true
     copyProc.running = true
     if (root.clipboardClearSeconds > 0) {
@@ -607,25 +643,35 @@ Item {
   // WITHOUT `started` or `exited` having fired first is the only
   // observable signature of that case (confirmed empirically -- see the PR
   // description) -- onRunningChanged below is what catches it.
-  Process {
+  //
+  // A GuardedProcess (issue #20), not a raw Process -- see
+  // GuardedProcess.qml for what that buys: a timeout+watchdog even though
+  // wl-copy backgrounding itself to hold the selection is the normal,
+  // expected case, and orphan-safety/consistency with pasteProc/
+  // clearCopyProc below.
+  GuardedProcess {
     id: copyProc
-    property string _payload: ""
+    timeoutMs: root.clipboardTimeoutMs
     property bool _started: false
     property bool _finished: false
 
     onStarted: {
       copyProc._started = true
-      write(copyProc._payload)
-      copyProc._payload = ""
+      write(copyProc.secret)
+      copyProc.secret = ""
       copyProc.stdinEnabled = false
     }
-    onExited: function (exitCode, exitStatus) {
+    onGuardedExited: function (exitCode, exitStatus) {
       copyProc._finished = true
       if (exitCode === 0 && exitStatus === 0) {
         root._onClipboardCopyResult(true, "")
       } else {
         root._onClipboardCopyResult(false, "wl-copy exited with an error (code " + exitCode + ").")
       }
+    }
+    onGuardedTimedOut: {
+      copyProc._finished = true
+      root._onClipboardCopyResult(false, "wl-copy did not respond within the timeout window and was force-stopped.")
     }
     onRunningChanged: {
       if (running) return // _started/_finished already reset by _copyToClipboard() before this
@@ -645,20 +691,32 @@ Item {
     interval: 30000
     onTriggered: {
       if (!root.revealedEntry || !root.revealedEntry.current) return
-      pasteProc._expected = root.revealedEntry.current
-      pasteProc.command = [root.wlPastePath, "--no-newline"]
+      pasteProc.secret = root.revealedEntry.current
+      pasteProc.argv = [root.wlPastePath, "--no-newline"]
       pasteProc.running = true
     }
   }
 
-  Process {
+  // A GuardedProcess (issue #20), not a raw Process -- this is the exact
+  // call site that bug was filed against: a hung wl-paste here previously
+  // had no timeout, no watchdog, and nothing that ever cleared
+  // `_expected`/`secret` or reaped the child. See GuardedProcess.qml.
+  GuardedProcess {
     id: pasteProc
-    property string _expected: ""
+    timeoutMs: root.clipboardTimeoutMs
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var expected = pasteProc._expected
-        pasteProc._expected = ""
+        // Deliberately reads then clears `secret` itself, right here, on
+        // the NORMAL exit path -- see GuardedProcess.qml's guardedExited
+        // doc comment for why that component itself does not auto-clear
+        // `secret` on this path: this comparison is the one place that
+        // still needs the value. The ABNORMAL path (a hang, or
+        // clearReveal() calling pasteProc.stop() out from under this) is
+        // what GuardedProcess itself guarantees clears `secret` and reaps
+        // the process even if this handler never runs at all.
+        var expected = pasteProc.secret
+        pasteProc.secret = ""
         if (Logic.clipboardStillOurs(text, expected)) clearCopyProc.running = true
       }
     }
@@ -667,19 +725,43 @@ Item {
   // An empty/cleared selection via wl-copy's own --clear flag -- documented
   // wl-clipboard behavior -- rather than writing an empty string over
   // stdin, which would just copy an empty string as the new clipboard
-  // content instead of clearing the offer entirely.
-  Process {
+  // content instead of clearing the offer entirely. A GuardedProcess too
+  // (issue #20), for orphan-safety/consistency, even though it carries no
+  // secret of its own.
+  GuardedProcess {
     id: clearCopyProc
-    command: [root.wlCopyPath, "--clear"]
+    timeoutMs: root.clipboardTimeoutMs
+    argv: [root.wlCopyPath, "--clear"]
   }
 
   // Test-only diagnostic -- NOT part of the public API, may change or
-  // disappear without notice. Confirms the clipboard-copy Process's argv
+  // disappear without notice. Confirms the clipboard-copy process's argv
   // never carries the code as an element (issue #5: the code goes over
   // stdin only, since argv is world-readable via /proc/<pid>/cmdline) --
   // mirrors Backend.qml's own __debugListStdoutText()/__debugShowStdoutText()
-  // test hooks. See tests/panel.qmltest.qml.
+  // test hooks. Reads `argv` (what THIS file asked GuardedProcess to run),
+  // not `command` (what GuardedProcess actually execs after prepending its
+  // own `timeout -s KILL <n>` wrapper -- issue #20) -- the invariant this
+  // asserts is about what PanelState.qml itself puts in argv, unchanged by
+  // that wrapper. See tests/panel.qmltest.qml.
   function __debugCopyArgvIsPathOnly() {
-    return copyProc.command.length === 1 && copyProc.command[0] === root.wlCopyPath
+    return copyProc.argv.length === 1 && copyProc.argv[0] === root.wlCopyPath
+  }
+
+  // Test-only diagnostic -- NOT part of the public API, may change or
+  // disappear without notice. Exposes exactly the two facts issue #20's
+  // bug was about, for both clipboard processes that ever hold a secret:
+  // whether the process is still running (an orphan, if a hang was never
+  // reaped) and whether `secret` still holds a plaintext value (a
+  // decrypted code retained past when it should have been). See
+  // tests/panel.qmltest.qml's hung-wl-paste and clearReveal()-authority
+  // scenarios.
+  function __debugClipboardGuardState() {
+    return {
+      copyProcRunning: copyProc.running,
+      copyProcSecret: copyProc.secret,
+      pasteProcRunning: pasteProc.running,
+      pasteProcSecret: pasteProc.secret
+    }
   }
 }
