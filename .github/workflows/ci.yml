@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  manifest:
+    name: manifest.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: manifest.json is valid JSON
+        run: jq -e . manifest.json > /dev/null
+
+      # omarchy-plugin-validate is the actual script `omarchy plugin validate`
+      # runs (basecamp/omarchy's bin/omarchy-plugin-validate) -- it checks
+      # schemaVersion, required fields, that every entryPoints value is a
+      # safe relative path that exists, barWidget.defaultSection, reserved/
+      # invalid ids, and that no symlink is present in the plugin folder.
+      # It's pure bash + jq with no dependency on Quickshell or a running
+      # shell, so unlike the actual `omarchy plugin validate` CLI (which
+      # needs the full Omarchy install) it genuinely runs the same checks on
+      # a bare GitHub runner. Pinned to v4.0.3 -- the Omarchy version this
+      # plugin was developed and manually verified against -- rather than a
+      # moving branch, and fetched fresh each run rather than vendored, so
+      # a change to the upstream schema doesn't silently go stale here.
+      - name: omarchy plugin validate (upstream schema check)
+        run: |
+          set -euo pipefail
+          # Pinned to the immutable commit v4.0.3 points at, not the tag
+          # itself -- a tag can be moved or re-pointed upstream, and this
+          # step downloads a script and then executes it. The checksum is
+          # verified too, so a rewrite at that path fails the job loudly
+          # instead of silently running something else.
+          curl -fsSL -o /tmp/omarchy-plugin-validate \
+            https://raw.githubusercontent.com/basecamp/omarchy/0534987009061cbe2dacdde4ad564092ab698d12/bin/omarchy-plugin-validate
+          echo 'f7507e5042eb970e3dc918bdf6bf251c7557443892a77e71a17d7019ddde72c8  /tmp/omarchy-plugin-validate' \
+            | sha256sum -c -
+          chmod +x /tmp/omarchy-plugin-validate
+          /tmp/omarchy-plugin-validate "$GITHUB_WORKSPACE"
+
+  node-tests:
+    name: node test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Cli.js / PanelLogic.js are QML .pragma library files; these tests
+      # strip that directive and eval the rest as plain JS in a vm context
+      # (see each test file's own header), so they need nothing beyond a
+      # plain node runtime -- no Quickshell, no display, no fixtures beyond
+      # what's already checked in.
+      - name: tests/cli.test.js
+        run: node tests/cli.test.js
+
+      - name: tests/panel-logic.test.js
+        run: node tests/panel-logic.test.js
+
+  qml-tests:
+    name: QML suite (tests/run-qml-tests.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skipped -- Quickshell + Omarchy shell libs are unavailable here
+        run: |
+          cat <<'EOF'
+          tests/run-qml-tests.sh is intentionally NOT run in this CI job.
+
+          It drives Backend.qml/PanelState.qml/Widget.qml under a real
+          `quickshell -p` process, and widget-dock.qmltest.qml additionally
+          imports qs.Ui / qs.Commons from /usr/share/omarchy/shell (the real
+          Omarchy shell package). Neither Quickshell nor an Omarchy install
+          exists on a GitHub-hosted runner, and there is no headless way to
+          get either one here that would still be exercising the real thing
+          rather than a stand-in for it -- so rather than fake a pass (or a
+          hollow "skip" that quietly drops coverage without saying so), this
+          job says so out loud and stops.
+
+          Run it locally on an Omarchy machine instead:
+            bash tests/run-qml-tests.sh
+          EOF
