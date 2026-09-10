@@ -264,7 +264,13 @@ PopupWindow {
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: root.state.loadErrorMessage || "Couldn't read the OTPClient database."
+          // Names the fix, not the symptom (issue #6) -- mapped from the
+          // TYPED state Backend/Cli.js report (loadErrorState), never a raw
+          // Backend/Cli.js message string, so a decrypt/parse failure can
+          // never surface a password/code/secret fragment here even if
+          // Backend's own message text ever changed. See
+          // PanelLogic.degradedStateMessage()'s own docstring.
+          text: Logic.degradedStateMessage(root.state.loadErrorState, "list", root.state.loadErrorMessage)
           color: root.urgent
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -322,6 +328,13 @@ PopupWindow {
     readonly property bool confirmArmed: root.state.hotpConfirmKey === rowKey
     readonly property bool isPending: root.state.isRevealPendingFor(modelData.issuer, modelData.account)
     readonly property bool isRevealed: root.state.isRevealedFor(modelData.issuer, modelData.account)
+    // Issue #6: a reveal-time failure (bad-password, db-missing, malformed,
+    // would-prompt, crashed, instance-conflict, binary-missing, or a
+    // same-row "no matching entry anymore" empty/busy) is surfaced on the
+    // row it belongs to, not silently dropped -- see PanelState.qml's
+    // isRevealFailedFor()/revealFailedKey docstrings for why this couldn't
+    // just reuse isRevealed's own matching.
+    readonly property bool isRevealFailed: root.state.isRevealFailedFor(modelData.issuer, modelData.account)
 
     height: isRevealed ? 64 : 46
     radius: Style.cornerRadius
@@ -382,12 +395,14 @@ PopupWindow {
           text: rowDelegate.isRevealed
             ? Logic.revealStatusText(rowDelegate.modelData.type, root.state.clipboardCopyState,
                 root.state.revealedEntry.secondsRemaining, root.state.revealCountdownIsFallback)
-            : (rowDelegate.confirmArmed
-              ? Logic.confirmPromptText(rowDelegate.modelData.type)
-              : (rowDelegate.isPending ? "Decrypting…" : rowDelegate.modelData.account))
+            : (rowDelegate.isRevealFailed
+              ? Logic.degradedStateMessage(root.state.revealErrorState, "show", root.state.revealErrorMessage)
+              : (rowDelegate.confirmArmed
+                ? Logic.confirmPromptText(rowDelegate.modelData.type)
+                : (rowDelegate.isPending ? "Decrypting…" : rowDelegate.modelData.account)))
           color: rowDelegate.isRevealed
             ? (root.state.clipboardCopyState === "failed" ? root.urgent : root.accent)
-            : (rowDelegate.confirmArmed ? root.urgent : root.safeMuted)
+            : ((rowDelegate.confirmArmed || rowDelegate.isRevealFailed) ? root.urgent : root.safeMuted)
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
           font.bold: rowDelegate.isRevealed
