@@ -30,8 +30,15 @@ jobs:
       - name: omarchy plugin validate (upstream schema check)
         run: |
           set -euo pipefail
+          # Pinned to the immutable commit v4.0.3 points at, not the tag
+          # itself -- a tag can be moved or re-pointed upstream, and this
+          # step downloads a script and then executes it. The checksum is
+          # verified too, so a rewrite at that path fails the job loudly
+          # instead of silently running something else.
           curl -fsSL -o /tmp/omarchy-plugin-validate \
-            https://raw.githubusercontent.com/basecamp/omarchy/v4.0.3/bin/omarchy-plugin-validate
+            https://raw.githubusercontent.com/basecamp/omarchy/0534987009061cbe2dacdde4ad564092ab698d12/bin/omarchy-plugin-validate
+          echo 'f7507e5042eb970e3dc918bdf6bf251c7557443892a77e71a17d7019ddde72c8  /tmp/omarchy-plugin-validate' \
+            | sha256sum -c -
           chmod +x /tmp/omarchy-plugin-validate
           /tmp/omarchy-plugin-validate "$GITHUB_WORKSPACE"
 
