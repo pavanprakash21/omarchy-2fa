@@ -118,21 +118,29 @@ widget's own tunables live:
 | `maskCodes` | `true` | Mask a revealed code on screen until you click it to reveal. The clipboard copy always happens regardless of this — masking only ever affects what's painted on screen. |
 | `revealSeconds` | `5` | How long a code auto-clears from the panel when otpclient-cli itself gives no expiry to count down (always true for HOTP). A TOTP code's own real, CLI-reported countdown is never shortened or lengthened by this — only the panel's own fallback window is. |
 | `clipboardClearSeconds` | `0` | Clear the clipboard this many seconds after a copy, but only if it still holds the exact code this panel put there — a copy you made yourself in the meantime is left alone. `0` disables this entirely. |
-| `database` | `""` | Passed through to `--database`. **Not yet wired** — see below; the default (unset) is today's existing, unaffected behavior. |
+| `database` | `""` | Which OTPClient database to read, passed through to `--database`. Accepts either a path or a database *name* as printed by `otpclient-cli --list-databases`. Unset (the default) means no `--database` argument at all, i.e. your configured default database. |
 | `icon` | a lock/shield glyph | Override the bar (and dock) icon glyph. |
 | `confirmHotp` | `true` | Accepted, but **cannot be disabled** — see below. |
 
-### `database` isn't wired yet
+### Pointing at a non-default database
 
-`otpclient-cli` is deliberately never given a `-d/--database` argument by
-this plugin today (an already-reviewed decision from issue #2: it only ever
-talks to your already-configured default database). Actually honoring an
-override here means adding that argument to `Backend.qml`/`Cli.js`, both of
-which are a separately owned, already twice-reviewed layer outside the
-scope of the settings work that added this key. Leaving `database` unset —
-the default, `""` — is exactly today's existing behavior, so nothing
-regresses; setting it to a real path currently has no effect. Tracked as a
-follow-up ([#17](https://github.com/pavanprakash21/omarchy-2fa/issues/17)).
+If you keep more than one OTPClient database, set `database` to the one this
+panel should read:
+
+```json
+"database": "/home/you/.config/otpclient/work.db"
+```
+
+The value is handed to `otpclient-cli -d/--database` verbatim as a single
+argument, so both forms that flag accepts work — an absolute path, or a
+database name as listed by `otpclient-cli --list-databases`. It applies to
+the token list and to every reveal alike, so the panel can never end up
+listing one database and decrypting from another.
+
+Leaving it unset passes no `--database` argument at all, which is the
+default-database behavior described everywhere else in this file. A value
+pointing at a database that doesn't exist surfaces as the same "database
+not found" state as any other missing database, not as a parse error.
 
 ### `confirmHotp` cannot be disabled
 
