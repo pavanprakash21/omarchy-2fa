@@ -40,10 +40,15 @@ Item {
   // to anything persisted from this issue set -----------------------------
   // <= 0 disables the optional post-copy clipboard-clear timer.
   property int clipboardClearSeconds: 0
-  // When true, a reveal still copies to the clipboard but the code is never
-  // painted on screen. Defaults false: issue #5's default reveal behavior
-  // is to show what was just copied. #8 owns wiring this to a persisted
-  // "maskCodes" setting.
+  // Conceals the on-screen code for a reveal; a copy to the clipboard
+  // still ALWAYS happens regardless of this (see onShowSucceeded below --
+  // adversarial review found an earlier version had this backwards,
+  // suppressing the copy instead of the on-screen paint, which is the
+  // opposite of "safe to have open on a shared screen"). Defaults false:
+  // issue #5's default reveal behavior is to show what was just copied.
+  // #8 owns wiring this to a persisted "maskCodes" setting; the masked
+  // code is still revealable on screen via the explicit unmaskRevealedCode()
+  // action below, since #8's whole point is a default, not a one-way lock.
   property bool maskRevealedCode: false
 
   // otpclient-cli never reports validity_seconds for HOTP (there is no
@@ -87,6 +92,37 @@ Item {
   property string revealErrorMessage: ""
   property string _pendingKey: ""
 
+  // Whether the CURRENTLY revealed code's on-screen display is concealed
+  // (see maskRevealedCode's docstring). Snapshotted from maskRevealedCode
+  // at reveal time rather than bound live to it, so toggling the setting
+  // mid-reveal can't retroactively unmask something already being shown
+  // masked, or vice versa -- and so unmaskRevealedCode() below has
+  // somewhere of its own to write "reveal it anyway" without mutating the
+  // setting itself.
+  property bool codeMaskedOnScreen: false
+
+  // True when the current reveal's countdown is THIS UI's own fabricated
+  // auto-clear window (hotpRevealFallbackSeconds), not a real CLI-reported
+  // expiry (TOTP's validity_seconds). Computed from whether the CLI
+  // actually reported one (entry.secondsRemaining >= 0), not from the
+  // entry's `type` string -- deliberately data-driven rather than
+  // identity-driven, so it stays correct even for the same unrecognized-
+  // type edge case isDefinitivelyTotp()/requiresConfirmation() exist for.
+  // Popup.qml must word a fabricated countdown differently from a real
+  // one (see PanelLogic.revealStatusText()) -- an HOTP code does not
+  // expire on a clock, and showing one tick down like a TOTP code would
+  // say something false about how the token works.
+  property bool revealCountdownIsFallback: false
+
+  // Outcome of the LAST clipboard-copy attempt for the current reveal --
+  // "idle" | "copying" | "copied" | "failed". Adversarial review found a
+  // failed wl-copy invocation (including the binary not existing at all)
+  // was previously reported to the user as a successful copy, with no
+  // signal anywhere that anything had gone wrong. See copyProc's wiring
+  // below for how "failed" is actually detected.
+  property string clipboardCopyState: "idle"
+  property string clipboardCopyError: ""
+
   // Delegates to Logic.entryKey's JSON-encoded pairing (see PanelLogic.js)
   // rather than a hand-rolled separator, so a pending/confirm key built
   // from raw issuer/account strings here can never diverge from the one
@@ -104,6 +140,58 @@ Item {
   function isRevealedFor(issuer, account) {
     return root.revealState === "revealed" && !!root.revealedEntry
       && root.revealedEntry.issuer === issuer && root.revealedEntry.account === account
+  }
+
+  // Explicit "show me anyway" action for a masked reveal (maskRevealedCode
+  // -- #8). The clipboard copy already happened unconditionally when the
+  // reveal succeeded (see onShowSucceeded) -- this only affects the
+  // on-screen paint.
+  function unmaskRevealedCode() {
+    root.codeMaskedOnScreen = false
+  }
+
+  // Drops the current reveal (and/or an armed HOTP confirm) the moment the
+  // selection no longer points at the row either one belongs to.
+  //
+  // Adversarial review (HIGH, confirmed): moveSelection() never called
+  // clearReveal(), and isRevealedFor() matches by the revealed entry's own
+  // issuer/account rather than by selectedIndex, so Popup.qml kept
+  // painting a plaintext code on screen no matter where the highlight
+  // moved -- reveal, arrow to another row, walk away, and the code stays
+  // legible for its full countdown window regardless.
+  //
+  // Selection can change in more ways than just moveSelection() stepping
+  // it by one, which is why this is a function called explicitly at every
+  // site that can change what row is selected, rather than something
+  // hung off selectedIndex's own change signal alone:
+  //   - Popup.qml's row click sets selectedIndex directly.
+  //   - setFilterText() can re-clamp selectedIndex to a value that's
+  //     numerically UNCHANGED but now denotes a completely different
+  //     entry, because the list underneath it narrowed -- a plain
+  //     onSelectedIndexChanged handler would miss exactly that case.
+  //
+  // Reads Logic.entryAt(filteredEntries, selectedIndex) directly rather
+  // than the selectedEntry convenience property -- confirmed empirically
+  // that when this runs from an onSelectedIndexChanged handler,
+  // selectedEntry's OWN binding (which also depends on selectedIndex) can
+  // still be evaluating against the OLD selectedIndex at that point: QML
+  // delivers a property's changed signal to every connected receiver in
+  // connection order, and there is no guarantee an explicit
+  // onSelectedIndexChanged handler runs after every OTHER binding that
+  // also depends on selectedIndex has refreshed. filteredEntries has no
+  // such dependency on selectedIndex, so computing the entry from it
+  // directly here sidesteps the ordering hazard entirely.
+  function _syncRevealToSelection() {
+    var entry = Logic.entryAt(root.filteredEntries, root.selectedIndex)
+    var key = entry ? Logic.entryKey(entry) : ""
+
+    if (root.hotpConfirmKey !== "" && root.hotpConfirmKey !== key) root.cancelHotpConfirm()
+
+    var revealKey = root.revealedEntry ? Logic.entryKey(root.revealedEntry) : ""
+    var pendingKey = root._pendingKey
+    if ((revealKey !== "" && revealKey !== key) || (pendingKey !== "" && pendingKey !== key)) {
+      root.clearReveal()
+    }
   }
 
   // ---- Lifecycle ------------------------------------------------------------
@@ -145,20 +233,28 @@ Item {
 
   function setFilterText(text) {
     root.filterText = String(text || "")
-    // The set of visible rows just changed; an armed-but-unconfirmed HOTP
-    // gate could otherwise survive onto a different row that lands in the
-    // same position once results narrow.
-    root.cancelHotpConfirm()
     root.selectedIndex = Logic.clampIndex(root.selectedIndex, root.filteredEntries.length)
+    // Explicit call, not just reliance on onSelectedIndexChanged below:
+    // clamping can leave selectedIndex at the SAME numeric value while the
+    // entry it now points at is a completely different one, because the
+    // list underneath just narrowed -- see _syncRevealToSelection()'s
+    // docstring.
+    root._syncRevealToSelection()
   }
 
   function moveSelection(delta) {
     var next = Logic.clampIndex(root.selectedIndex + delta, root.filteredEntries.length)
     if (next === root.selectedIndex) return
-    root.selectedIndex = next
-    var entry = root.selectedEntry
-    if (!entry || Logic.entryKey(entry) !== root.hotpConfirmKey) root.cancelHotpConfirm()
+    root.selectedIndex = next // onSelectedIndexChanged below runs _syncRevealToSelection()
   }
+
+  // Catches every OTHER way selectedIndex can change -- a row click in
+  // Popup.qml sets it directly, and a fresh --list's onListSucceeded
+  // re-clamps it -- without each of those call sites having to remember to
+  // call _syncRevealToSelection() itself. setFilterText() above still calls
+  // it explicitly too, for the one case (see its own comment) this signal
+  // can't catch on its own: the index value not changing at all.
+  onSelectedIndexChanged: root._syncRevealToSelection()
 
   function cancelHotpConfirm() {
     hotpConfirmTimer.stop()
@@ -168,12 +264,23 @@ Item {
   // Enter (or a click) on the selected row. Returns true if it did
   // something (armed a confirm, or issued a reveal request), false if
   // there was nothing to act on or a call was already in flight.
+  //
+  // Gated on Logic.requiresConfirmation(), a DENY-list, not
+  // Logic.isHotp()'s ALLOW-list -- adversarial review (MEDIUM, confirmed):
+  // an entry whose type is empty/missing/unrecognized (not reachable
+  // through today's otpclient-cli, which only ever emits "TOTP"/"HOTP",
+  // but not provably unreachable forever either) fell through isHotp()'s
+  // false branch and revealed immediately, no confirmation armed, on a
+  // --show call that might be exactly the one that advances and persists
+  // a real counter. requiresConfirmation() is true for anything that
+  // isn't affirmatively, definitely TOTP, so the unknown case is treated
+  // as needing confirmation rather than being silently allowed through.
   function activateSelected() {
     var entry = root.selectedEntry
     if (!entry) return false
     if (backend.busy) return false // a call is already in flight; ignore rather than error
 
-    if (Logic.isHotp(entry.type)) {
+    if (Logic.requiresConfirmation(entry.type)) {
       var key = Logic.entryKey(entry)
       if (root.hotpConfirmKey === key) {
         // Second, deliberate activation of the same armed row -- issue #5's
@@ -191,11 +298,17 @@ Item {
     return root._requestReveal(entry, false)
   }
 
-  function _requestReveal(entry, isHotp) {
+  // `viaHotpPath` selects which Backend entry point handles the request --
+  // requestHotpCode() (gated behind activateSelected()'s confirm step
+  // above, for anything requiresConfirmation() flagged) or requestCode()
+  // (confirmed-TOTP only). Functionally identical otpclient-cli invocation
+  // either way; the distinction is entirely about which caller has already
+  // done its job gating it.
+  function _requestReveal(entry, viaHotpPath) {
     root.clearReveal()
     root.revealState = "loading"
     root._pendingKey = root._keyFor(entry.issuer, entry.account)
-    var ok = isHotp
+    var ok = viaHotpPath
       ? backend.requestHotpCode(entry.issuer, entry.account)
       : backend.requestCode(entry.issuer, entry.account, entry.type)
     if (!ok) {
@@ -207,7 +320,8 @@ Item {
   }
 
   // Drops the currently revealed code, if any. Called on countdown
-  // timeout, on panel close, and before starting a new reveal -- never
+  // timeout, on panel close, on selection change (see
+  // _syncRevealToSelection()), and before starting a new reveal -- never
   // more than one code held at a time (issue #5).
   function clearReveal() {
     countdownTimer.stop()
@@ -216,6 +330,10 @@ Item {
     root.revealedEntry = null
     root.revealErrorMessage = ""
     root._pendingKey = ""
+    root.codeMaskedOnScreen = false
+    root.revealCountdownIsFallback = false
+    root.clipboardCopyState = "idle"
+    root.clipboardCopyError = ""
   }
 
   // ---- Backend wiring -------------------------------------------------------
@@ -241,20 +359,33 @@ Item {
       root.revealErrorMessage = ""
       // entry.secondsRemaining is -1 whenever the CLI didn't report one at
       // all (always true for HOTP -- see hotpRevealFallbackSeconds's own
-      // docstring). Normalize it into the displayed/held object itself,
-      // right here, rather than leaving the raw -1 in `revealedEntry` until
-      // the first countdownTimer tick a full second later papers over it --
+      // docstring). Recorded BEFORE normalizing it below, since that's the
+      // one moment this function can still tell a real CLI-reported expiry
+      // apart from this UI's own fabricated auto-clear window (see
+      // revealCountdownIsFallback's docstring -- adversarial review found
+      // Popup.qml rendering both identically, which tells the user an HOTP
+      // code is "expiring" on a clock it doesn't have).
+      var isFallback = !(entry.secondsRemaining >= 0)
+      // Normalize the seconds into the displayed/held object itself, right
+      // here, rather than leaving the raw -1 in `revealedEntry` until the
+      // first countdownTimer tick a full second later papers over it --
       // otherwise a caller reading revealedEntry.secondsRemaining in that
       // first second (Popup.qml's own binding included) would show "-1s".
-      var initial = Math.max(1, entry.secondsRemaining >= 0 ? entry.secondsRemaining : root.hotpRevealFallbackSeconds)
+      var initial = Math.max(1, isFallback ? root.hotpRevealFallbackSeconds : entry.secondsRemaining)
       var normalized = {}
       for (var k in entry) normalized[k] = entry[k]
       normalized.secondsRemaining = initial
       root.revealedEntry = normalized
+      root.revealCountdownIsFallback = isFallback
+      root.codeMaskedOnScreen = root.maskRevealedCode
       root.revealState = "revealed"
       countdownTimer.secondsLeft = initial
       countdownTimer.restart()
-      if (!root.maskRevealedCode) root._copyToClipboard(entry.current)
+      // ALWAYS copies, regardless of maskRevealedCode -- adversarial
+      // review (MEDIUM, confirmed): masking must conceal the on-screen
+      // code, never suppress the copy that's the entire point of revealing
+      // it. maskRevealedCode only gates codeMaskedOnScreen above.
+      root._copyToClipboard(entry.current)
     }
     onShowFailed: function (issuer, account, state, message) {
       if (root._keyFor(issuer, account) !== root._pendingKey) return
@@ -317,7 +448,14 @@ Item {
   // real /usr/bin/wl-copy on the machine this was built on (see the PR
   // description).
   function _copyToClipboard(code) {
-    if (typeof code !== "string" || code.length === 0) return
+    if (typeof code !== "string" || code.length === 0) {
+      root._onClipboardCopyResult(false, "No code to copy.")
+      return
+    }
+    root.clipboardCopyState = "copying"
+    root.clipboardCopyError = ""
+    copyProc._started = false
+    copyProc._finished = false
     copyProc.command = [root.wlCopyPath]
     copyProc._payload = code
     copyProc.stdinEnabled = true
@@ -328,13 +466,56 @@ Item {
     }
   }
 
+  // Records the outcome of the LAST copy attempt on root, for Popup.qml to
+  // render (PanelLogic.revealStatusText()) instead of the unconditional
+  // "code copied" adversarial review found -- see clipboardCopyState's
+  // docstring.
+  function _onClipboardCopyResult(success, message) {
+    // A response for a copy that's since been superseded (a new reveal
+    // already started, or the reveal was cleared entirely) must not
+    // retroactively flip clipboardCopyState back from "idle"/a newer
+    // attempt's own state.
+    if (root.revealState !== "revealed" && root.revealState !== "loading") return
+    root.clipboardCopyState = success ? "copied" : "failed"
+    root.clipboardCopyError = success ? "" : message
+  }
+
+  // Quickshell's Process exposes `started` and `exited` as real QML
+  // signals, but a process that fails to start at all (bad path, not
+  // executable) fires NEITHER -- only an internal console WARN
+  // ("Process failed to start...") that isn't reachable from QML.
+  // Adversarial review reproduced exactly this by pointing wlCopyPath at a
+  // nonexistent binary: revealState still settled to "revealed" with no
+  // error anywhere, because nothing here was listening for the one signal
+  // Quickshell doesn't give a name to. `running` flipping back to false
+  // WITHOUT `started` or `exited` having fired first is the only
+  // observable signature of that case (confirmed empirically -- see the PR
+  // description) -- onRunningChanged below is what catches it.
   Process {
     id: copyProc
     property string _payload: ""
+    property bool _started: false
+    property bool _finished: false
+
     onStarted: {
+      copyProc._started = true
       write(copyProc._payload)
       copyProc._payload = ""
       copyProc.stdinEnabled = false
+    }
+    onExited: function (exitCode, exitStatus) {
+      copyProc._finished = true
+      if (exitCode === 0 && exitStatus === 0) {
+        root._onClipboardCopyResult(true, "")
+      } else {
+        root._onClipboardCopyResult(false, "wl-copy exited with an error (code " + exitCode + ").")
+      }
+    }
+    onRunningChanged: {
+      if (running) return // _started/_finished already reset by _copyToClipboard() before this
+      if (!copyProc._started && !copyProc._finished) {
+        root._onClipboardCopyResult(false, "wl-copy could not be started.")
+      }
     }
   }
 

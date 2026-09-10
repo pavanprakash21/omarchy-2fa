@@ -68,6 +68,70 @@ test("isHotp is false for missing/undefined type, never throws", () => {
   assert(!Logic.isHotp(null));
 });
 
+// ---- isDefinitivelyTotp / requiresConfirmation (adversarial review #3) --
+// The confirm gate must be a DENY-list (require confirmation for anything
+// that isn't affirmatively TOTP), not an ALLOW-list (require it only for
+// anything affirmatively HOTP) -- an earlier version gated on isHotp(type)
+// directly, which let an unrecognized type through unconfirmed.
+
+test("isDefinitivelyTotp is true only for the literal TOTP string", () => {
+  assert(Logic.isDefinitivelyTotp("TOTP"));
+  assert(Logic.isDefinitivelyTotp("totp")); // case-insensitive, like isHotp()
+  assert(!Logic.isDefinitivelyTotp("HOTP"));
+});
+
+test("requiresConfirmation is the deny-list inverse of isDefinitivelyTotp", () => {
+  assert(!Logic.requiresConfirmation("TOTP"));
+  assert(Logic.requiresConfirmation("HOTP"));
+});
+
+test("requiresConfirmation is TRUE for an unrecognized/empty/missing type -- the actual bug", () => {
+  // otpclient-cli has only ever been observed to emit "TOTP"/"HOTP", but an
+  // allow-list gated on isHotp() would let any THIRD value slip through
+  // unconfirmed straight into a --show call that might mutate a counter.
+  assert(Logic.requiresConfirmation(""));
+  assert(Logic.requiresConfirmation(undefined));
+  assert(Logic.requiresConfirmation(null));
+  assert(Logic.requiresConfirmation("something-else"));
+});
+
+// ---- revealStatusText (adversarial review #2, #5) ------------------------
+
+test("revealStatusText renders a real CLI expiry as '<n>s remaining'", () => {
+  assertEqual(Logic.revealStatusText("TOTP", "copied", 18, false), "TOTP code copied · 18s remaining");
+});
+
+test("revealStatusText renders the fabricated HOTP window as an auto-clear, never as an expiry", () => {
+  const text = Logic.revealStatusText("HOTP", "copied", 30, true);
+  assertEqual(text, "HOTP code copied · auto-clears in 30s");
+  assert(!/remaining/.test(text), "must not use expiry wording for a fabricated countdown");
+});
+
+test("revealStatusText never claims success when the copy failed", () => {
+  const text = Logic.revealStatusText("TOTP", "failed", 18, false);
+  assert(/FAILED/.test(text), "must surface the failure, not report success");
+  assert(!/code copied/i.test(text), "must not still say the code was copied");
+});
+
+test("revealStatusText distinguishes a still-in-flight copy from a completed one", () => {
+  assert(!/copied/i.test(Logic.revealStatusText("TOTP", "copying", 18, false)));
+});
+
+test("revealStatusText tolerates a negative/garbage secondsRemaining without going negative", () => {
+  assert(/^TOTP code copied · 0s remaining$/.test(Logic.revealStatusText("TOTP", "copied", -5, false)));
+});
+
+// ---- confirmPromptText ----------------------------------------------------
+
+test("confirmPromptText names the HOTP counter consequence only for an actual HOTP type", () => {
+  assert(/HOTP counter/.test(Logic.confirmPromptText("HOTP")));
+});
+
+test("confirmPromptText does not claim an HOTP-specific consequence for an unrecognized type", () => {
+  assert(!/HOTP/.test(Logic.confirmPromptText("")));
+  assert(!/HOTP/.test(Logic.confirmPromptText(undefined)));
+});
+
 // ---- entryKey -----------------------------------------------------------
 
 test("entryKey is stable for the same issuer/account", () => {

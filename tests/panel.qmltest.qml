@@ -186,6 +186,7 @@ Item {
         root.check("B: reveal succeeds", ok && totpState.revealState === "revealed")
         root.check("B: revealed code matches the fixture", totpState.revealedEntry && totpState.revealedEntry.current === "482913")
         root.check("B: revealedEntry carries the CLI's seconds-remaining, not a period", totpState.revealedEntry.secondsRemaining === 3)
+        root.check("B: a real CLI expiry is NOT flagged as the fabricated fallback countdown", totpState.revealCountdownIsFallback === false)
         root.check("B: clipboard copy argv is the binary path ONLY -- never the code as an argv element", totpState.__debugCopyArgvIsPathOnly())
 
         // Give the fixture's async stdin-capture a moment to land, then
@@ -194,6 +195,7 @@ Item {
         // and landed intact, not just that argv looked right.
         root.sleep(150, function () {
           checkCopied.running = true
+          root.check("B: a successful copy is reflected as clipboardCopyState 'copied'", totpState.clipboardCopyState === "copied")
         })
 
         // The countdown ticks the CLI's own seconds-remaining down and
@@ -263,6 +265,7 @@ Item {
           root.check("C: HOTP counter is surfaced", hotpState.revealedEntry.counter === 11)
           root.check("C: HOTP has no CLI-reported expiry -- the fixed fallback window is used, not a fabricated period",
             hotpState.revealedEntry.secondsRemaining === hotpState.hotpRevealFallbackSeconds)
+          root.check("C: the fallback countdown is flagged as such, distinct from a real expiry", hotpState.revealCountdownIsFallback === true)
           hotpState.close()
           root.runNext()
         })
@@ -414,6 +417,180 @@ Item {
     }
   }
 
+  // ==== Group H: moving the selection clears an active reveal ============
+  // (adversarial review, HIGH, confirmed) -- moveSelection() never called
+  // clearReveal(), and isRevealedFor() matched by the revealed entry's own
+  // issuer/account rather than by selectedIndex, so a revealed code kept
+  // painting on screen no matter where the highlight moved: reveal, arrow
+  // away, walk off -- the code stayed legible for its whole countdown
+  // window regardless of the selection ever having left that row.
+  PanelState {
+    id: moveClearState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-capture.sh")
+    wlPastePath: root.fx("wl-paste-readback.sh")
+  }
+
+  function groupH() {
+    moveClearState.open()
+    root.waitUntil(function () { return moveClearState.loadState !== "loading" }, 3000, function () {
+      moveClearState.activateSelected() // GitHub, TOTP -- reveals directly
+      root.waitUntil(function () { return moveClearState.revealState === "revealed" }, 3000, function () {
+        root.check("H: revealed before moving the selection", moveClearState.revealedEntry && moveClearState.revealedEntry.current === "482913")
+
+        moveClearState.moveSelection(1) // GitHub -> Example
+        root.check("H: moveSelection() clears the reveal SYNCHRONOUSLY, no wait needed", moveClearState.revealState === "idle")
+        root.check("H: revealedEntry is dropped, not just hidden", moveClearState.revealedEntry === null)
+
+        // The exact same class of bug via a DIFFERENT write path: Popup.qml's
+        // row click sets selectedIndex directly rather than going through
+        // moveSelection() -- must be caught too, not just the arrow-key path.
+        moveClearState.activateSelected() // Example, TOTP -- reveals again
+        root.waitUntil(function () { return moveClearState.revealState === "revealed" }, 3000, function () {
+          root.check("H: revealed again after the first clear", moveClearState.revealState === "revealed")
+          moveClearState.selectedIndex = 0 // simulates Popup.qml's TokenRow onClicked
+          root.check("H: a direct selectedIndex write (the click path) ALSO clears the reveal", moveClearState.revealState === "idle" && moveClearState.revealedEntry === null)
+
+          // And the filter-driven case: clamping can leave the NUMERIC
+          // selectedIndex unchanged while the entry underneath it changes.
+          moveClearState.activateSelected() // GitHub again
+          root.waitUntil(function () { return moveClearState.revealState === "revealed" }, 3000, function () {
+            moveClearState.setFilterText("bank") // narrows to just the HOTP row at index 0
+            root.check("H: a filter change that re-points index 0 at a different entry also clears the reveal",
+              moveClearState.revealState === "idle" && moveClearState.revealedEntry === null)
+            root.runNext()
+          })
+        })
+      })
+    })
+  }
+
+  // ==== Group I: a failed clipboard copy must never be reported as a =====
+  // success (adversarial review, HIGH, confirmed). Two distinct failure
+  // shapes, because Quickshell's Process signals them differently:
+  //   - a binary that doesn't exist at all fires NEITHER `started` NOR
+  //     `exited` -- only an internal console WARN with no QML signal.
+  //   - a binary that runs and exits nonzero fires a real `exited`.
+  PanelState {
+    id: copyNeverStartsState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: "/definitely/not/a/real/binary/wl-copy"
+  }
+  PanelState {
+    id: copyExitFailsState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-fail-exit.sh")
+  }
+
+  function groupI() {
+    copyNeverStartsState.open()
+    root.waitUntil(function () { return copyNeverStartsState.loadState !== "loading" }, 3000, function () {
+      copyNeverStartsState.activateSelected()
+      root.waitUntil(function () { return copyNeverStartsState.revealState === "revealed" }, 3000, function () {
+        // The reveal itself (the otpclient-cli round trip) succeeded --
+        // only the clipboard copy is broken. Give copyProc's
+        // onRunningChanged a moment to observe the "never started" case.
+        root.waitUntil(function () { return copyNeverStartsState.clipboardCopyState !== "copying" && copyNeverStartsState.clipboardCopyState !== "idle" }, 2000, function (settled) {
+          root.check("I: a wl-copy that never starts is surfaced as clipboardCopyState 'failed', not silently 'copied'",
+            settled && copyNeverStartsState.clipboardCopyState === "failed")
+          root.check("I: a failure message is recorded, not just a bare flag", copyNeverStartsState.clipboardCopyError.length > 0)
+          root.check("I: the code itself is still shown -- reveal succeeded even though the copy didn't", copyNeverStartsState.revealedEntry && copyNeverStartsState.revealedEntry.current === "482913")
+
+          copyExitFailsState.open()
+          root.waitUntil(function () { return copyExitFailsState.loadState !== "loading" }, 3000, function () {
+            copyExitFailsState.activateSelected()
+            root.waitUntil(function () { return copyExitFailsState.revealState === "revealed" }, 3000, function () {
+              root.waitUntil(function () { return copyExitFailsState.clipboardCopyState !== "copying" && copyExitFailsState.clipboardCopyState !== "idle" }, 2000, function (settled2) {
+                root.check("I: a wl-copy that starts but exits nonzero is ALSO surfaced as 'failed'",
+                  settled2 && copyExitFailsState.clipboardCopyState === "failed")
+                root.runNext()
+              })
+            })
+          })
+        })
+      })
+    })
+  }
+
+  // ==== Group J: the confirm gate is a DENY-list, not an ALLOW-list ======
+  // (adversarial review, MEDIUM, confirmed). An entry whose type is
+  // neither "TOTP" nor "HOTP" must still require confirmation -- gating on
+  // isHotp(type) directly let it fall through unconfirmed into a --show
+  // call that might be exactly the kind that mutates a counter.
+  PanelState {
+    id: unknownTypeState
+    binaryCandidates: [root.fx("panel-unknown-type.sh")]
+    timeoutMs: 3000
+  }
+
+  function groupJ() {
+    unknownTypeState.open()
+    root.waitUntil(function () { return unknownTypeState.loadState !== "loading" }, 3000, function () {
+      root.check("J: fixture entry has an unrecognized (empty) type", unknownTypeState.selectedEntry && unknownTypeState.selectedEntry.type === "")
+
+      var firstActivate = unknownTypeState.activateSelected()
+      root.check("J: first activation on an unrecognized-type row is accepted (arms the gate)", firstActivate === true)
+      root.check("J: it does NOT reveal unconfirmed -- this is the actual bug being regression-tested", unknownTypeState.revealState === "idle")
+      root.check("J: the gate is armed for this row", unknownTypeState.hotpConfirmKey === Logic.entryKey({ issuer: "Mystery", account: "acct" }))
+
+      var confirmed = unknownTypeState.activateSelected()
+      root.check("J: the second, deliberate activation is accepted", confirmed === true)
+      root.waitUntil(function () { return unknownTypeState.revealState !== "loading" }, 3000, function (ok) {
+        root.check("J: only after confirming does it actually reveal", ok && unknownTypeState.revealState === "revealed")
+        root.runNext()
+      })
+    })
+  }
+
+  // ==== Group K: maskRevealedCode conceals the SCREEN, never the copy ====
+  // (adversarial review, MEDIUM, confirmed). An earlier version gated the
+  // clipboard copy itself on !maskRevealedCode -- turning masking on would
+  // have suppressed the copy while still painting the raw code on screen,
+  // the exact opposite of "safe to have open on a shared screen".
+  PanelState {
+    id: maskState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-capture.sh")
+    wlPastePath: root.fx("wl-paste-readback.sh")
+    maskRevealedCode: true
+  }
+
+  function groupK() {
+    maskState.open()
+    root.waitUntil(function () { return maskState.loadState !== "loading" }, 3000, function () {
+      maskState.activateSelected()
+      root.waitUntil(function () { return maskState.revealState === "revealed" }, 3000, function () {
+        root.check("K: maskRevealedCode conceals the on-screen code", maskState.codeMaskedOnScreen === true)
+        root.check("K: ...but the code itself is still held for display once unmasked", maskState.revealedEntry && maskState.revealedEntry.current === "482913")
+
+        root.waitUntil(function () { return maskState.clipboardCopyState !== "copying" && maskState.clipboardCopyState !== "idle" }, 2000, function () {
+          root.check("K: the copy STILL happened despite masking -- masking must never suppress it", maskState.clipboardCopyState === "copied")
+
+          checkMaskedCopyLanded.running = true
+        })
+      })
+    })
+  }
+
+  Process {
+    id: checkMaskedCopyLanded
+    command: [root.fx("wl-paste-readback.sh")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.check("K: the actual clipboard content matches the (screen-masked) code", text === "482913")
+        root.check("K: unmaskRevealedCode() is available to reveal it on screen on request", typeof maskState.unmaskRevealedCode === "function")
+        maskState.unmaskRevealedCode()
+        root.check("K: calling it clears the on-screen mask", maskState.codeMaskedOnScreen === false)
+        root.runNext()
+      }
+    }
+  }
+
   Component.onCompleted: {
     root.steps = [
       root.groupA,
@@ -422,7 +599,11 @@ Item {
       root.groupD,
       root.groupE,
       root.groupF,
-      root.groupG
+      root.groupG,
+      root.groupH,
+      root.groupI,
+      root.groupJ,
+      root.groupK
     ]
     root.runNext()
   }

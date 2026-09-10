@@ -372,12 +372,22 @@ PopupWindow {
         Text {
           textFormat: Text.PlainText
           visible: text !== ""
+          // Never claims "copied" unconditionally -- Logic.revealStatusText
+          // renders whatever root.state.clipboardCopyState actually is
+          // ("copying"/"copied"/"failed"), and distinguishes a real
+          // CLI-reported expiry from this UI's own fabricated HOTP
+          // auto-clear window via revealCountdownIsFallback. See
+          // PanelLogic.js's own docstring for exactly which adversarial
+          // findings this covers.
           text: rowDelegate.isRevealed
-            ? (rowDelegate.modelData.type + " code copied · " + Math.max(0, root.state.revealedEntry.secondsRemaining) + "s")
+            ? Logic.revealStatusText(rowDelegate.modelData.type, root.state.clipboardCopyState,
+                root.state.revealedEntry.secondsRemaining, root.state.revealCountdownIsFallback)
             : (rowDelegate.confirmArmed
-              ? "Press Enter again to confirm -- this advances the HOTP counter"
+              ? Logic.confirmPromptText(rowDelegate.modelData.type)
               : (rowDelegate.isPending ? "Decrypting…" : rowDelegate.modelData.account))
-          color: rowDelegate.isRevealed ? root.accent : (rowDelegate.confirmArmed ? root.urgent : root.safeMuted)
+          color: rowDelegate.isRevealed
+            ? (root.state.clipboardCopyState === "failed" ? root.urgent : root.accent)
+            : (rowDelegate.confirmArmed ? root.urgent : root.safeMuted)
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
           font.bold: rowDelegate.isRevealed
@@ -385,16 +395,47 @@ PopupWindow {
           width: parent.width
         }
 
-        Text {
-          textFormat: Text.PlainText
+        Row {
           visible: rowDelegate.isRevealed
-          text: rowDelegate.modelData.account + "  ·  " + (root.state.revealedEntry ? root.state.revealedEntry.current : "")
-          color: root.fg
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
-          elide: Text.ElideRight
           width: parent.width
+          spacing: 6
+
+          Text {
+            textFormat: Text.PlainText
+            text: rowDelegate.modelData.account
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          Text {
+            id: codeText
+            textFormat: Text.PlainText
+            // Masked by maskRevealedCode (#8) -- concealed on screen but
+            // already copied to the clipboard regardless (see
+            // PanelState.qml's onShowSucceeded/codeMaskedOnScreen
+            // docstrings: an earlier version had this backwards). A click
+            // on the masked text reveals it on screen without issuing a
+            // new decrypt.
+            text: {
+              var code = root.state.revealedEntry ? root.state.revealedEntry.current : ""
+              return root.state.codeMaskedOnScreen ? "•".repeat(Math.max(6, code.length)) : code
+            }
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+
+            MouseArea {
+              anchors.fill: parent
+              visible: root.state.codeMaskedOnScreen
+              enabled: root.state.codeMaskedOnScreen
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.state.unmaskRevealedCode()
+            }
+          }
         }
       }
     }
