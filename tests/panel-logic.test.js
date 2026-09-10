@@ -142,7 +142,7 @@ test("confirmPromptText does not claim an HOTP-specific consequence for an unrec
 
 const ALL_KNOWN_STATES = [
   "binary-missing", "would-prompt", "bad-password", "db-missing",
-  "malformed", "crashed", "instance-conflict", "busy"
+  "malformed", "crashed", "instance-conflict", "busy", "empty"
 ];
 
 test("degradedStateMessage renders a non-empty, distinct message for every known state", () => {
