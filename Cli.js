@@ -54,14 +54,25 @@
 // Backend.qml, which is a deliberately separate, explicitly-named entry
 // point from the ordinary (idempotent, TOTP) requestCode().
 //
-// CONCURRENCY (confirmed, not mentioned anywhere in the issue): running two
-// otpclient-cli invocations against the same database at the same time
-// corrupts *both* -- observed exit code 1 with empty stdout on one and a
-// GDBus/org.gtk.Actions D-Bus registration error on stderr of the other,
-// with no indication in either output that anything was wrong. The same
-// two invocations run one after the other were both clean. Backend.qml
-// therefore serializes ALL invocations (list and show alike) through one
-// shared in-flight gate, never just a per-call-kind one.
+// CONCURRENCY (corrected after adversarial review -- the original claim
+// here was wrong): running two otpclient-cli invocations at the same time
+// does NOT corrupt the database -- up to 12-way parallel invocations were
+// run repeatedly under adversarial testing with clean md5/content checks
+// every time. What actually happens is a GLib GApplication D-Bus
+// single-instance race: one process wins and behaves normally, and the
+// loser(s) exit 1 having touched no files, with
+// "Failed to register: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod:
+// No such interface \"org.gtk.Actions\" on object at path
+// /com/github/paolostivanin/OTPClient" on stderr. isInstanceConflictExit()
+// below matches that signature so it gets its own typed state
+// ("instance-conflict") instead of falling through to "malformed". Backend
+// serializes its own invocations anyway (not to prevent corruption, but so
+// a losing, wasted invocation doesn't routinely happen just from this
+// widget's own list+show calls overlapping), and shares that gate across
+// every Backend instance in the process (see Shared.js) since the widget
+// renders per-monitor -- but that can't do anything about a fully separate
+// process, e.g. the OTPClient GUI, also being open, which is exactly why
+// the D-Bus signature is matched and surfaced rather than assumed away.
 //
 // -m/--match-exact is not optional on --show. Without it, otpclient-cli's
 // matching is g_ascii_strcasecmp (case-insensitive *equality*, not
@@ -108,6 +119,31 @@ function wrap(binaryPath, argvTail, timeoutMs) {
   return [TIMEOUT_BIN, "-s", "KILL", String(timeoutSeconds(timeoutMs)), binaryPath].concat(argvTail)
 }
 
+// Absolute-path fallback: `env` resolves its first argument through PATH
+// itself, inside the child, at exec time. This is a cheap way to find an
+// otpclient-cli installed somewhere other than /usr/bin or /usr/local/bin
+// (a user-local ~/.local/bin install, a Flatpak export shim, etc.) without
+// Backend.qml doing its own directory scanning or ever invoking a shell.
+// `name` is always one of Backend.qml's own fixed binaryCandidates entries
+// (in production, the fixed literal "otpclient-cli"; tests use a different
+// fixed name to point this at a fixture script placed on PATH) -- never
+// data from the database -- so this doesn't reopen the shell-injection
+// concern; it's exactly as safe as any other fixed argv element here.
+// The real absolute path `env` finds is not reported back to us; see
+// Backend.qml's binaryPath doc comment for what that means for callers.
+var PATH_LOOKUP_BIN = "/usr/bin/env"
+
+function wrapViaPath(name, argvTail, timeoutMs) {
+  return [TIMEOUT_BIN, "-s", "KILL", String(timeoutSeconds(timeoutMs)), PATH_LOOKUP_BIN, name].concat(argvTail)
+}
+
+// A `binaryCandidates` entry is a request to resolve via PATH (rather than
+// a literal absolute path to invoke directly) when it doesn't start with
+// "/". Bare command names have no other meaning in this list.
+function isPathLookupCandidate(candidate) {
+  return typeof candidate === "string" && candidate.length > 0 && candidate.charAt(0) !== "/"
+}
+
 function listArgv() {
   return ["--list", "--output=json"]
 }
@@ -139,6 +175,15 @@ function isTimeoutExit(exitCode) {
 
 function isWrapperFailedExit(exitCode) {
   return exitCode === WRAPPER_FAILED_CODE
+}
+
+// Confirmed signature of the GApplication D-Bus single-instance race (see
+// the CONCURRENCY note above): the losing process's stderr. Matched
+// specifically enough (both "failed to register" AND the GDBus.Error
+// prefix) that it shouldn't false-positive on an unrelated stderr line.
+function isInstanceConflictStderr(stderrText) {
+  var err = stderrText || ""
+  return /failed to register/i.test(err) && /gdbus\.error/i.test(err)
 }
 
 function isPlainObject(v) {
@@ -257,13 +302,21 @@ function parseShow(text) {
 // Classifies a run that Backend.qml has already determined did not time
 // out and did not fail to exec (both handled upstream of this using
 // exitStatus/exitCode -- see Backend.qml). `kind` is "list" or "show".
-// Returns { state, message, entries? , entry? }. `state` is always one of:
-// ok, bad-password, db-missing, would-prompt, malformed, empty.
+// Returns { state, message, entries? , entry? }. `state` is one of: ok,
+// bad-password, db-missing, malformed, empty, instance-conflict. (Backend
+// additionally reports would-prompt and crashed, from exitStatus alone --
+// see its docstring -- so this function never returns those two itself.)
 function classify(exitCode, stdoutText, stderrText, kind) {
   var err = stderrText || ""
 
   if (isWrapperFailedExit(exitCode)) {
     return { state: "malformed", message: "The timeout wrapper itself failed to run otpclient-cli (exit 125)." }
+  }
+  if (isInstanceConflictStderr(err)) {
+    return {
+      state: "instance-conflict",
+      message: "otpclient-cli couldn't start because another instance (the OTPClient GUI, or this widget on another monitor) is already using it. Try again in a moment."
+    }
   }
   if (/incorrect password/i.test(err)) {
     return { state: "bad-password", message: "Incorrect database password." }

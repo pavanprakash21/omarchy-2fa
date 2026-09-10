@@ -108,6 +108,19 @@ test("timeoutSeconds rounds up and floors at 1", () => {
   assertEqual(Cli.timeoutSeconds(4001), 5);
 });
 
+// ---- PATH-lookup fallback (adversarial review item #6) -------------------
+
+test("isPathLookupCandidate distinguishes absolute paths from bare names", () => {
+  assert(!Cli.isPathLookupCandidate("/usr/bin/otpclient-cli"));
+  assert(Cli.isPathLookupCandidate("otpclient-cli"));
+  assert(!Cli.isPathLookupCandidate(""));
+});
+
+test("wrapViaPath resolves through /usr/bin/env with the exact candidate name, still under -s KILL", () => {
+  const cmd = Cli.wrapViaPath("otpclient-cli", ["--list", "--output=json"], 4000);
+  assertEqual(cmd, ["/usr/bin/timeout", "-s", "KILL", "4", "/usr/bin/env", "otpclient-cli", "--list", "--output=json"]);
+});
+
 // ---- exit-code classification ------------------------------------------
 // NOTE: exit codes turned out NOT to reliably discriminate outcomes against
 // the real binary (wrong password, missing db, and a bad password-file
@@ -265,6 +278,26 @@ test("legacy '...does not exist.' phrasing also maps to db-missing (defensive, u
 test("'Empty password not allowed' -> would-prompt (defensive secondary path; see Backend.qml for the primary one)", () => {
   const r = Cli.classify(255, "", "Empty password not allowed\nNo password provided, exiting.\n", "show");
   assertEqual(r.state, "would-prompt");
+});
+
+// ---- instance-conflict (adversarial review item #3: corrected concurrency
+// story -- concurrent invocations don't corrupt the database, but they do
+// race for a GApplication D-Bus name, and the loser prints this) ----------
+
+test("isInstanceConflictStderr matches the confirmed GDBus/org.gtk.Actions signature", () => {
+  const err = 'Failed to register: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: No such interface "org.gtk.Actions" on object at path /com/github/paolostivanin/OTPClient';
+  assert(Cli.isInstanceConflictStderr(err));
+});
+
+test("isInstanceConflictStderr does not false-positive on an unrelated stderr line", () => {
+  assert(!Cli.isInstanceConflictStderr("Incorrect password."));
+  assert(!Cli.isInstanceConflictStderr(""));
+});
+
+test("classify() routes the D-Bus collision to instance-conflict, not malformed", () => {
+  const err = 'Failed to register: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: No such interface "org.gtk.Actions" on object at path /com/github/paolostivanin/OTPClient';
+  const r = Cli.classify(1, "", err, "list");
+  assertEqual(r.state, "instance-conflict");
 });
 
 test("unparseable stdout with no recognized stderr -> malformed, never throws", () => {

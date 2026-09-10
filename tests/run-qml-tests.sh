@@ -30,15 +30,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp "$REPO/Backend.qml" "$REPO/Cli.js" "$DIR/backend.qmltest.qml" "$WORKDIR/"
+cp "$REPO/Backend.qml" "$REPO/Cli.js" "$REPO/Shared.js" "$DIR/backend.qmltest.qml" "$WORKDIR/"
 cp -r "$DIR/fixtures" "$WORKDIR/fixtures"
 
-quickshell -p "$WORKDIR/backend.qmltest.qml" >"$LOG" 2>&1 &
+# The path-lookup scenario (adversarial review item #6: fall back to PATH
+# when the fixed absolute candidates aren't found) needs a real executable
+# reachable by a bare name via PATH -- stage one and prepend it.
+mkdir -p "$WORKDIR/pathbin"
+cp "$DIR/fixtures/ok-list.sh" "$WORKDIR/pathbin/otp-fixture-pathlookup-test"
+chmod +x "$WORKDIR/pathbin/otp-fixture-pathlookup-test"
+
+PATH="$WORKDIR/pathbin:$PATH" quickshell -p "$WORKDIR/backend.qmltest.qml" >"$LOG" 2>&1 &
 PID=$!
 
-# Generous ceiling: the slowest scenario (would-prompt) waits out a 700ms
-# timeout; 15s covers that many times over on a loaded machine.
-DEADLINE=$((SECONDS + 15))
+# Generous ceiling: scenarios run sequentially now (the shared gate makes
+# that a correctness requirement, not just a convenience -- see the test
+# file's header), and the slowest single one waits out a 700ms timeout;
+# 25s covers the whole chain many times over on a loaded machine.
+DEADLINE=$((SECONDS + 25))
 while ! grep -q "ALL_DONE" "$LOG" 2>/dev/null; do
   if [ "$SECONDS" -ge "$DEADLINE" ]; then
     echo "TIMED OUT waiting for ALL_DONE -- log so far:" >&2
