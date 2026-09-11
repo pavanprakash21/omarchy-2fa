@@ -108,6 +108,26 @@ Item {
     onListSucceeded: function () { root.check("instance-conflict: must not succeed", false); root.runNext() }
   }
 
+  // ---- Scenario: instance-conflict, the SECOND confirmed real signature
+  // (issue #25) -- a live run with the OTPClient GUI open produced this
+  // exact stderr, and the original isInstanceConflictStderr() only knew
+  // the org.gtk.Actions/UnknownMethod one above, so this used to fall
+  // through to "malformed" -- the actual bug issue #25 reports. Also
+  // checks the message no longer implies a transient condition (the old
+  // "Try again in a moment" wording): this is an upstream bug in
+  // otpclient-cli <= 5.1.6, only fixed by closing the GUI or upgrading.
+  Backend {
+    id: conflictV2Backend
+    binaryCandidates: [root.fx("instance-conflict-v2.sh")]
+    timeoutMs: 3000
+    onListFailed: function (state, message) {
+      root.check("instance-conflict-v2: state is instance-conflict, NOT malformed", state === "instance-conflict")
+      root.check("instance-conflict-v2: message does not claim this is transient", !/try again/i.test(message))
+      root.runNext()
+    }
+    onListSucceeded: function () { root.check("instance-conflict-v2: must not succeed", false); root.runNext() }
+  }
+
   // ---- Scenario: ok list, and that its output is cleared after emission --
   Backend {
     id: okListBackend
@@ -202,6 +222,99 @@ Item {
       root.runNext()
     }
     onListSucceeded: function () { root.check("db-missing: must not succeed", false); root.runNext() }
+  }
+
+  // ---- Scenario: no-database vs would-prompt are DISTINCT states (issue
+  // #24) -- the actual bug being fixed: "no database configured at all"
+  // and "database exists, Secret Service off" used to collapse into one
+  // guessed `would-prompt`, from a live misdiagnosis that named the wrong
+  // fix. Both fixtures below also complete almost instantly (no hang),
+  // proving the fix isn't just a relabeling -- it also stops paying the
+  // full timeoutMs on either path (see Backend.qml's stdin-closed
+  // scenario further down for the actual mechanism this depends on).
+  Backend {
+    id: noDatabaseBackend
+    binaryCandidates: [root.fx("no-database.sh")]
+    timeoutMs: 2000
+    property double t0: 0
+    onListFailed: function (state, message) {
+      root.check("no-database: state is no-database, not would-prompt/db-missing", state === "no-database")
+      root.check("no-database: completes fast, not via the timeout backstop", (Date.now() - noDatabaseBackend.t0) < 1500)
+      root.runNext()
+    }
+    onListSucceeded: function () { root.check("no-database: must not succeed", false); root.runNext() }
+  }
+  Backend {
+    id: wouldPromptFastBackend
+    binaryCandidates: [root.fx("would-prompt-fast.sh")]
+    timeoutMs: 2000
+    property double t0: 0
+    onListFailed: function (state, message) {
+      root.check("would-prompt-fast: state is would-prompt, not no-database", state === "would-prompt")
+      root.check("would-prompt-fast: completes fast, not via the timeout backstop", (Date.now() - wouldPromptFastBackend.t0) < 1500)
+      root.runNext()
+    }
+    onListSucceeded: function () { root.check("would-prompt-fast: must not succeed", false); root.runNext() }
+  }
+  // ---- Scenario: stdin is actually closed for every invocation (issue
+  // #24) -- tests/fixtures/stdin-closed.sh reads its own stdin and reports
+  // whether it saw data or immediate EOF. If Backend.qml ever regresses to
+  // leaving stdin open (see _spawn()'s docstring for exactly why this is
+  // NOT the property's own documented default and has to be done in two
+  // places), this fixture blocks until `-s KILL` fires and the state comes
+  // back would-prompt/crashed after the full timeoutMs instead of this
+  // fast, deterministic malformed. Covers BOTH listProc and showProc,
+  // since they are two separate Process items sharing this logic.
+  Backend {
+    id: stdinClosedListBackend
+    binaryCandidates: [root.fx("stdin-closed.sh")]
+    timeoutMs: 1500
+    property double t0: 0
+    onListFailed: function (state, message) {
+      root.check("stdin-closed (list): completes fast, not via the timeout backstop", (Date.now() - stdinClosedListBackend.t0) < 1000)
+      root.check("stdin-closed (list): state is malformed (the fixture's own exit 1, not a hang)", state === "malformed")
+      root.check("stdin-closed (list): fixture confirms it got immediate EOF", message.indexOf("STDIN_CLOSED_OK") !== -1)
+      root.check("stdin-closed (list): fixture did NOT block reading data off stdin", message.indexOf("STDIN_NOT_CLOSED") === -1)
+      root.runNext()
+    }
+    onListSucceeded: function () { root.check("stdin-closed (list): must not succeed", false); root.runNext() }
+  }
+  Backend {
+    id: stdinClosedShowBackend
+    binaryCandidates: [root.fx("stdin-closed.sh")]
+    timeoutMs: 1500
+    property double t0: 0
+    onShowFailed: function (issuer, account, state, message) {
+      root.check("stdin-closed (show): completes fast, not via the timeout backstop", (Date.now() - stdinClosedShowBackend.t0) < 1000)
+      root.check("stdin-closed (show): state is malformed", state === "malformed")
+      root.check("stdin-closed (show): fixture confirms it got immediate EOF", message.indexOf("STDIN_CLOSED_OK") !== -1)
+      root.check("stdin-closed (show): fixture did NOT block reading data off stdin", message.indexOf("STDIN_NOT_CLOSED") === -1)
+      root.runNext()
+    }
+    onShowSucceeded: function () { root.check("stdin-closed (show): must not succeed", false); root.runNext() }
+  }
+  // Repeats the SAME (reused, long-lived) listProc/showProc a second time
+  // each, to guard the specific two-place toggle _spawn()'s docstring calls
+  // out: stdinEnabled has to be set back to true before every spawn, not
+  // just the first, since these Process items persist across calls.
+  Backend {
+    id: stdinClosedRepeatBackend
+    binaryCandidates: [root.fx("stdin-closed.sh")]
+    timeoutMs: 1500
+    property int calls: 0
+    property double t0: 0
+    onListFailed: function (state, message) {
+      stdinClosedRepeatBackend.calls++
+      root.check("stdin-closed-repeat call " + stdinClosedRepeatBackend.calls + ": still fast", (Date.now() - stdinClosedRepeatBackend.t0) < 1000)
+      root.check("stdin-closed-repeat call " + stdinClosedRepeatBackend.calls + ": still gets immediate EOF", message.indexOf("STDIN_CLOSED_OK") !== -1)
+      if (stdinClosedRepeatBackend.calls < 2) {
+        stdinClosedRepeatBackend.t0 = Date.now()
+        stdinClosedRepeatBackend.listInventory()
+      } else {
+        root.runNext()
+      }
+    }
+    onListSucceeded: function () { root.check("stdin-closed-repeat: must not succeed", false); root.runNext() }
   }
 
   // ---- Scenario: empty show (confirmed shape: exit 255, "[]", no stderr) --
@@ -398,6 +511,7 @@ Item {
       function () { hangBackend.listInventory() },
       function () { crashBackend.listInventory() },
       function () { conflictBackend.listInventory() },
+      function () { conflictV2Backend.listInventory() },
       function () { okListBackend.listInventory() },
       function () { okShowBackend.requestCode("GitHub", "pavan@smaply.com", "TOTP") },
       function () { hotpBackend.requestHotpCode("Bank", "acct1") },
@@ -409,6 +523,11 @@ Item {
       },
       function () { badPwBackend.requestCode("GitHub", "pavan@smaply.com", "TOTP") },
       function () { dbMissingBackend.listInventory() },
+      function () { noDatabaseBackend.t0 = Date.now(); noDatabaseBackend.listInventory() },
+      function () { wouldPromptFastBackend.t0 = Date.now(); wouldPromptFastBackend.listInventory() },
+      function () { stdinClosedListBackend.t0 = Date.now(); stdinClosedListBackend.listInventory() },
+      function () { stdinClosedShowBackend.t0 = Date.now(); stdinClosedShowBackend.requestCode("x", "y", "TOTP") },
+      function () { stdinClosedRepeatBackend.t0 = Date.now(); stdinClosedRepeatBackend.listInventory() },
       function () { emptyShowBackend.requestCode("Nobody", "nobody", "TOTP") },
       function () { emptyListBackend.listInventory() },
       function () { malformedBackend.listInventory() },

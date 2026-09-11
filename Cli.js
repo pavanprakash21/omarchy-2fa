@@ -44,6 +44,36 @@
 //   no such account  -> NO stderr at all: exit 255, stdout is "[]". This is
 //                        the `empty` state, detected from the parsed JSON
 //                        shape, not from stderr.
+//   no database at all (issue #24) -> with stdin closed (see STDIN CLOSURE
+//                        below), otpclient-cli's interactive
+//                        "Type the absolute path to the database:" prompt
+//                        gets immediate EOF and prints "Couldn't get db
+//                        path from stdin", exit 255. Distinct from, and
+//                        checked separately from, "missing database file"
+//                        above: that one means a *configured* path that
+//                        isn't there; this one means nothing is configured
+//                        at all (no -d/--database given, no GSettings
+//                        default). Reported as the `no-database` state.
+//   Secret Service off, db exists (issue #24) -> with stdin closed, the
+//                        password prompt gets the same immediate EOF and
+//                        prints "Empty password not allowed" / "No
+//                        password provided, exiting.", exit 255 -- this is
+//                        the (now deterministic, no longer timeout-guessed)
+//                        `would-prompt` state below.
+//
+// STDIN CLOSURE (issue #24): Backend.qml now explicitly closes the child's
+// stdin (see its _spawn() and each Process's onRunningChanged) instead of
+// leaving it an open, silent pipe. Verified against a real otpclient-cli
+// 5.1.6: this turns BOTH of the two prompts above from a 4s hang guessed
+// at by a timeout into an immediate, distinct exit with distinct stderr
+// text -- which is what lets this file tell "no database configured" and
+// "Secret Service is off" apart at all, rather than collapsing both into
+// one timeout-inferred `would-prompt` guess (the original issue #24 bug: a
+// misdiagnosis that named the wrong fix). The OS-level `timeout -s KILL`
+// wrap and Backend.qml's own watchdog Timer are kept as a backstop for a
+// GENUINE hang (e.g. Secret Service present but D-Bus itself wedged) --
+// see Backend.qml's _handleExit() docstring -- but neither is the primary
+// signal for `would-prompt` anymore.
 // Every field is read defensively: wrong type or missing key is treated as
 // absent, never thrown.
 //
@@ -73,7 +103,7 @@
 // loser(s) exit 1 having touched no files, with
 // "Failed to register: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod:
 // No such interface \"org.gtk.Actions\" on object at path
-// /com/github/paolostivanin/OTPClient" on stderr. isInstanceConflictExit()
+// /com/github/paolostivanin/OTPClient" on stderr. isInstanceConflictStderr()
 // below matches that signature so it gets its own typed state
 // ("instance-conflict") instead of falling through to "malformed". Backend
 // serializes its own invocations anyway (not to prevent corruption, but so
@@ -83,6 +113,30 @@
 // renders per-monitor -- but that can't do anything about a fully separate
 // process, e.g. the OTPClient GUI, also being open, which is exactly why
 // the D-Bus signature is matched and surfaced rather than assumed away.
+//
+// ISSUE #25 -- a second, real-world instance-conflict signature (found on
+// the first two live runs of this plugin, both misdiagnoses -- see the
+// issue for the full writeup): with the GUI open, a live run produced
+// "GDBus.Error:org.freedesktop.DBus.Error.NotSupported: Application does
+// not handle command line arguments" instead of the
+// org.gtk.Actions/UnknownMethod text above. isInstanceConflictStderr() now
+// matches EITHER confirmed signature, plus a general "GDBus.Error +
+// mentions OTPClient's own D-Bus id/object path" shape, since a third
+// variant is plausible and the cost of a false negative here (silently
+// reported as "malformed", issue #25's actual bug) is worse than the cost
+// of a slightly loose match. Root cause, read from upstream source rather
+// than guessed at: otpclient-cli <= 5.1.6 (src/cli/main.c) registers the
+// SAME GApplication id as the GUI without G_APPLICATION_NON_UNIQUE, so
+// while the GUI holds that D-Bus name every CLI invocation becomes a
+// "remote" of the GUI, which does not handle command lines, and dies.
+// Fixed upstream in commit 7a9671e1 ("fix(cli): stop the CLI failing
+// whenever the GUI is running", 2026-09-02) by adding
+// G_APPLICATION_NON_UNIQUE -- present on otpclient-git (builds from
+// master), NOT present in the AUR otpclient package, which is pinned to
+// 5.1.6 and itself flagged out-of-date (see README). This is why the
+// instance-conflict message below does not say "try again" -- on an
+// affected version, waiting never clears it; closing the GUI (or updating)
+// is the only fix.
 //
 // -m/--match-exact is not optional on --show. Without it, otpclient-cli's
 // matching is g_ascii_strcasecmp (case-insensitive *equality*, not
@@ -227,13 +281,24 @@ function isWrapperFailedExit(exitCode) {
   return exitCode === WRAPPER_FAILED_CODE
 }
 
-// Confirmed signature of the GApplication D-Bus single-instance race (see
-// the CONCURRENCY note above): the losing process's stderr. Matched
-// specifically enough (both "failed to register" AND the GDBus.Error
-// prefix) that it shouldn't false-positive on an unrelated stderr line.
+// Confirmed signatures of the GApplication D-Bus single-instance race (see
+// the CONCURRENCY and ISSUE #25 notes above): TWO distinct stderr shapes
+// have been observed for the exact same root cause (otpclient-cli <= 5.1.6
+// registering the GUI's own application id), and issue #25 was exactly
+// this function only recognizing the first one, so the second fell through
+// to "malformed" -- a misdiagnosis in its own right. Every branch here
+// requires "gdbus.error" (never matched alone -- that string alone is too
+// generic) plus one of: the original "failed to register" phrasing, the
+// second confirmed "does not handle command line arguments" phrasing, or
+// -- for a plausible-but-unconfirmed third variant -- a mention of
+// OTPClient's own D-Bus application id or object path.
 function isInstanceConflictStderr(stderrText) {
   var err = stderrText || ""
-  return /failed to register/i.test(err) && /gdbus\.error/i.test(err)
+  if (!/gdbus\.error/i.test(err)) return false
+  return /failed to register/i.test(err) ||
+    /does not handle command line arguments/i.test(err) ||
+    /org\.gtk\.actions/i.test(err) ||
+    /com\.github\.paolostivanin\.otpclient/i.test(err)
 }
 
 function isPlainObject(v) {
@@ -353,9 +418,12 @@ function parseShow(text) {
 // out and did not fail to exec (both handled upstream of this using
 // exitStatus/exitCode -- see Backend.qml). `kind` is "list" or "show".
 // Returns { state, message, entries? , entry? }. `state` is one of: ok,
-// bad-password, db-missing, malformed, empty, instance-conflict. (Backend
-// additionally reports would-prompt and crashed, from exitStatus alone --
-// see its docstring -- so this function never returns those two itself.)
+// bad-password, db-missing, no-database, malformed, empty,
+// instance-conflict. (Backend additionally reports would-prompt and
+// crashed, from exitStatus/stderr -- see its docstring -- so this function
+// never returns "crashed" itself; it DOES now return "would-prompt"
+// directly and deterministically for the two closed-stdin stderr shapes
+// below -- see the STDIN CLOSURE note above.)
 function classify(exitCode, stdoutText, stderrText, kind) {
   var err = stderrText || ""
 
@@ -365,7 +433,12 @@ function classify(exitCode, stdoutText, stderrText, kind) {
   if (isInstanceConflictStderr(err)) {
     return {
       state: "instance-conflict",
-      message: "otpclient-cli couldn't start because another instance (the OTPClient GUI, or this widget on another monitor) is already using it. Try again in a moment."
+      // Deliberately does NOT say "try again" (see issue #25): this is a
+      // known upstream bug in otpclient-cli <= 5.1.6 (the current AUR
+      // otpclient package), fixed in commit 7a9671e1 but not yet in a
+      // tagged release. On an affected version this never clears on its
+      // own -- only closing the GUI or running a build with the fix does.
+      message: "otpclient-cli can't run while another OTPClient instance (most likely the GUI) holds its D-Bus name. This does not resolve itself -- close the other instance, or use a build with the upstream fix (otpclient-cli commit 7a9671e1)."
     }
   }
   if (/incorrect password/i.test(err)) {
@@ -374,11 +447,31 @@ function classify(exitCode, stdoutText, stderrText, kind) {
   if (/missing database file/i.test(err) || /does not exist/i.test(err)) {
     return { state: "db-missing", message: "OTPClient database not found." }
   }
-  // Defensive secondary path to would-prompt: only reachable if stdin was
-  // closed/EOF rather than the open-but-silent pipe Quickshell's Process
-  // gives the child by default (the default case hangs and is caught by
-  // Backend.qml's CrashExit check instead -- this is for e.g. a future
-  // change to stdinEnabled, or a different Quickshell version's defaults).
+  // Issue #24: no database configured at all (no -d/--database, no
+  // GSettings default) -- otpclient-cli's interactive "Type the absolute
+  // path to the database:" prompt got immediate EOF (stdin is now closed
+  // before every invocation -- see Backend.qml) and gave up with
+  // "Couldn't get db path from stdin". Distinct from db-missing above (a
+  // *configured* path that isn't there). This exact transcript was
+  // verified by the issue's own reporter against a real otpclient-cli
+  // 5.1.6 on a machine with no default database configured; NOT
+  // independently re-verified against a live process here (this
+  // development machine already has a default database configured, and
+  // clearing it to reproduce would mean touching real GSettings/dconf
+  // state, out of scope for this fix -- see tests/cli.test.js). Checked
+  // against BOTH stdout and stderr defensively: unlike this file's other
+  // stderr checks, which byte-diffed a real invocation, the exact stream
+  // this interactive-prompt text lands on was not independently confirmed.
+  if (/couldn't get db path from stdin/i.test(err) || /could not get db path from stdin/i.test(err) ||
+      /couldn't get db path from stdin/i.test(stdoutText || "") || /could not get db path from stdin/i.test(stdoutText || "")) {
+    return { state: "no-database", message: "otpclient-cli has no database configured at all (no --database given and no default set)." }
+  }
+  // Issue #24: database exists but Secret Service is off -- with stdin
+  // closed, the password prompt got immediate EOF and gave up with this
+  // exact text instead of hanging. This is now the PRIMARY, deterministic
+  // path to would-prompt (previously only reachable by guessing from a 4s
+  // timeout -- see Backend.qml's _handleExit(), which keeps that as a
+  // backstop for a genuine hang, not the primary signal anymore).
   if (/empty password not allowed/i.test(err) || /no password provided/i.test(err)) {
     return { state: "would-prompt", message: "otpclient-cli could not obtain a database password non-interactively." }
   }

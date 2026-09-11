@@ -140,9 +140,10 @@ function revealStatusText(type, clipboardCopyState, secondsRemaining, isFallback
 
 // Maps a Backend-reported typed state (see Backend.qml's listFailed/
 // showFailed docstring: binary-missing, would-prompt, bad-password,
-// db-missing, malformed, empty, crashed, instance-conflict -- plus this
-// panel's own synthetic "busy" for a call refused because another is
-// already in flight) to a message that NAMES THE FIX, not the symptom --
+// db-missing, no-database, malformed, empty, crashed, instance-conflict --
+// plus this panel's own synthetic "busy" for a call refused because
+// another is already in flight) to a message that NAMES THE FIX, not the
+// symptom --
 // issue #6's core requirement. Backend/Cli.js's own messages are written
 // for a developer reading a log (exit codes, elapsed-ms, raw stderr
 // fragments); none of them tell a user what to actually go and do.
@@ -186,6 +187,13 @@ function degradedStateMessage(state, context, fallbackMessage) {
       return "No OTPClient database found at the configured path. Set one up " +
         "in the OTPClient GUI, or check the path in " +
         "~/.config/otpclient/otpclient.cfg."
+    case "no-database":
+      // Issue #24: distinct from db-missing above -- there is no configured
+      // path to check at all, so pointing at otpclient.cfg here would be
+      // exactly the kind of wrong-fix message issue #6 exists to prevent.
+      return "No OTPClient database is configured yet -- otpclient-cli has " +
+        "nothing to read. Create one in the OTPClient GUI (or run " +
+        "otpclient-cli --import), then reopen this panel."
     case "malformed":
       return "otpclient-cli returned output this panel could not understand. " +
         "Reported as-is -- no automatic repair is attempted, since that could " +
@@ -196,9 +204,17 @@ function degradedStateMessage(state, context, fallbackMessage) {
         "configuration -- try running otpclient-cli --list in a terminal for " +
         "more detail."
     case "instance-conflict":
-      return "otpclient-cli couldn't run because another OTPClient process " +
-        "already has the database open -- most commonly the OTPClient GUI " +
-        "itself. Close it and try again."
+      // Issue #25: this used to say "try again in a moment", which implies
+      // a transient condition. It is not one -- on otpclient-cli <= 5.1.6
+      // (the AUR otpclient package, currently pinned to 5.1.6 and flagged
+      // out-of-date) the CLI cannot run AT ALL while the GUI is open, and
+      // waiting never clears it. Only closing the GUI, or using a build
+      // with the upstream fix, does.
+      return "otpclient-cli can't run because the OTPClient GUI is open -- " +
+        "on the current AUR otpclient package (5.1.6) this blocks every " +
+        "CLI call for as long as the GUI runs, and it will not clear on " +
+        "its own. Close the OTPClient GUI, or switch to the otpclient-git " +
+        "package, which already has the upstream fix."
     case "busy":
       return "Busy -- try again in a moment."
     case "empty":

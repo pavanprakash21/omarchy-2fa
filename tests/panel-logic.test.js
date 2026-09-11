@@ -141,7 +141,7 @@ test("confirmPromptText does not claim an HOTP-specific consequence for an unrec
 // echo something Backend/Cli.js read back from otpclient-cli.
 
 const ALL_KNOWN_STATES = [
-  "binary-missing", "would-prompt", "bad-password", "db-missing",
+  "binary-missing", "would-prompt", "bad-password", "db-missing", "no-database",
   "malformed", "crashed", "instance-conflict", "busy", "empty"
 ];
 
@@ -177,6 +177,22 @@ test("degradedStateMessage: db-missing points at the GUI's database setup and th
   assert(/otpclient\.cfg/.test(msg));
 });
 
+// ---- issue #24: no-database must read differently from db-missing -- a
+// "no database configured at all" machine told to check a config path (or
+// the wrong "Secret Service" fix) is the exact misdiagnosis issue #24
+// reports on a live run.
+test("degradedStateMessage: no-database points at CREATING a database, not a path to check", () => {
+  const msg = Logic.degradedStateMessage("no-database", "list", "otpclient-cli has no database configured at all.");
+  assert(/OTPClient GUI/.test(msg), "must point at the GUI as where to create one");
+  assert(!/Secret Service/.test(msg), "must not be confused with would-prompt's fix");
+});
+
+test("degradedStateMessage: no-database and db-missing are DISTINCT messages -- collapsing them is the regression this guards", () => {
+  const noDb = Logic.degradedStateMessage("no-database", "list", "x");
+  const dbMissing = Logic.degradedStateMessage("db-missing", "list", "x");
+  assert(noDb !== dbMissing);
+});
+
 test("degradedStateMessage: malformed is reported plainly, offers no repair", () => {
   const msg = Logic.degradedStateMessage("malformed", "list", "Could not parse otpclient-cli output.");
   assert(/no automatic repair/i.test(msg));
@@ -192,6 +208,20 @@ test("degradedStateMessage: instance-conflict names the OTPClient GUI as the lik
   const msg = Logic.degradedStateMessage("instance-conflict", "list", "raw stderr fragment");
   assert(/OTPClient GUI/.test(msg), "must call out the GUI being open -- the most actionable cause");
   assert(/close/i.test(msg), "must say what to do about it");
+});
+
+// ---- issue #25: the message must not claim this is transient. It's a
+// known upstream bug in otpclient-cli <= 5.1.6, fixed in commit 7a9671e1
+// but not in a tagged release -- on an affected version, waiting never
+// clears it. The old "Try again in a moment" wording implied otherwise.
+test("degradedStateMessage: instance-conflict does not say 'try again' -- waiting never helps on an affected otpclient-cli version", () => {
+  const msg = Logic.degradedStateMessage("instance-conflict", "list", "raw stderr fragment");
+  assert(!/try again/i.test(msg), "must not imply the condition is transient");
+});
+
+test("degradedStateMessage: instance-conflict also names updating to a fixed build as an option, not just closing the GUI", () => {
+  const msg = Logic.degradedStateMessage("instance-conflict", "list", "raw stderr fragment");
+  assert(/otpclient-git|upstream fix|7a9671e1/i.test(msg), "must mention the update path, not just close-and-hope");
 });
 
 test("degradedStateMessage: empty is context-sensitive -- a list-time empty differs from a show-time one", () => {
