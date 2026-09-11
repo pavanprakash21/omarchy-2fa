@@ -90,6 +90,73 @@ test("showArgv keeps shell metacharacters as inert argv elements", () => {
   assertEqual(argv.length, 7, "argv must still be exactly 7 elements, not shell-expanded");
 });
 
+// ---- database override (issue #17): -d/--database, threaded from
+// PanelState's `database` setting (issue #8) -- must stay byte-identical
+// to today when unset, and must appear as its OWN discrete argv element,
+// never interpolated, when set. See tests/backend.qmltest.qml's
+// "database wiring" scenarios for the real-Process-level half of this
+// same guarantee (a fixture that actually answers differently depending
+// on whether the flag showed up).
+
+test("listArgv is byte-identical to today when database is omitted", () => {
+  assertEqual(Cli.listArgv(), ["--list", "--output=json"]);
+});
+
+test("listArgv is byte-identical to today when database is an empty string", () => {
+  assertEqual(Cli.listArgv(""), ["--list", "--output=json"]);
+});
+
+test("listArgv prepends --database as its own discrete element when set to a path", () => {
+  const argv = Cli.listArgv("/home/user/.local/share/otpclient/test.db");
+  assertEqual(argv, ["--database", "/home/user/.local/share/otpclient/test.db", "--list", "--output=json"]);
+});
+
+test("listArgv accepts a bare database NAME (as printed by --list-databases), same flag", () => {
+  // -d/--database documents accepting EITHER a path or a name from
+  // --list-databases -- Cli.js must not try to tell them apart.
+  const argv = Cli.listArgv("work-database");
+  assertEqual(argv, ["--database", "work-database", "--list", "--output=json"]);
+});
+
+test("showArgv is byte-identical to today when database is omitted", () => {
+  const argv = Cli.showArgv("GitHub", "pavan@smaply.com");
+  assertEqual(argv, ["--show", "-a", "pavan@smaply.com", "-i", "GitHub", "-m", "--output=json"]);
+});
+
+test("showArgv is byte-identical to today when database is an empty string", () => {
+  const argv = Cli.showArgv("GitHub", "pavan@smaply.com", "");
+  assertEqual(argv, ["--show", "-a", "pavan@smaply.com", "-i", "GitHub", "-m", "--output=json"]);
+});
+
+test("showArgv prepends --database as its own discrete element when set to a path", () => {
+  const argv = Cli.showArgv("GitHub", "pavan@smaply.com", "/fixture/expected.db");
+  assertEqual(argv, ["--database", "/fixture/expected.db", "--show", "-a", "pavan@smaply.com", "-i", "GitHub", "-m", "--output=json"]);
+});
+
+test("showArgv accepts a bare database NAME too, same flag, same discrete-element shape", () => {
+  const argv = Cli.showArgv("GitHub", "pavan@smaply.com", "work-database");
+  assertEqual(argv, ["--database", "work-database", "--show", "-a", "pavan@smaply.com", "-i", "GitHub", "-m", "--output=json"]);
+});
+
+test("database value never gets interpolated into another argv element, even with shell metacharacters", () => {
+  const evil = "$(rm -rf ~); `touch pwned`; & | > <";
+  const argv = Cli.listArgv(evil);
+  assert(argv.indexOf(evil) !== -1, "the database value must appear verbatim as its own argv element");
+  assertEqual(argv, ["--database", evil, "--list", "--output=json"]);
+});
+
+test("listInventory()/requestCode()/requestHotpCode() share one argv builder path -- same database value, same flag placement", () => {
+  // Not a Backend.qml integration test (that's tests/backend.qmltest.qml) --
+  // just confirming, at the pure-argv level, that both builders treat an
+  // identical `database` value identically, so Backend.qml passing its one
+  // `database` property to both can't produce two different shapes.
+  const db = "/fixture/expected.db";
+  const listArgv = Cli.listArgv(db);
+  const showArgv = Cli.showArgv("Bank", "acct1", db);
+  assertEqual(listArgv.slice(0, 2), ["--database", db]);
+  assertEqual(showArgv.slice(0, 2), ["--database", db]);
+});
+
 test("no function in Cli.js can build an --export invocation", () => {
   const src2 = fs.readFileSync(cliPath, "utf8");
   assert(!/--export/.test(src2), "the string --export must not appear anywhere in Cli.js");
