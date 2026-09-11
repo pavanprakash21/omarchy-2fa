@@ -86,15 +86,34 @@ Item {
 
   // ---- Configuration --------------------------------------------------
 
-  // Paths/names to try for otpclient-cli, in order. An entry starting with
-  // "/" is invoked directly at that absolute path. A bare entry (no
-  // leading "/") is resolved via `/usr/bin/env <name>`, which does its own
-  // PATH lookup inside the child at exec time -- see Cli.wrapViaPath()'s
-  // doc comment for why that's still safe. Nothing here is ever resolved
-  // through a shell, and no candidate is ever built from database content.
+  // Paths to try for otpclient-cli, in order -- both genuine absolute
+  // paths, deliberately with NO bare-name/PATH-lookup fallback (issue #21:
+  // that third default candidate used to be the literal string
+  // "otpclient-cli", resolved via `/usr/bin/env otpclient-cli` -- see
+  // Cli.wrapViaPath()'s doc comment for how that mechanism works). Dropped
+  // rather than kept as a "documented trade-off", because it did not
+  // actually correspond to a documented, supported install path: this
+  // project's own README describes exactly one install method (AUR,
+  // `yay -S otpclient`), which lands at /usr/bin, already covered by the
+  // first candidate below; there was no Flatpak/user-local install this
+  // widget actually ships support for that the fallback was earning its
+  // keep for. Per this project's own threat model (issue #9: "a
+  // compromised or substituted otpclient-cli ... binary on a poisoned
+  // PATH"), a fallback that exists for a use case nothing here documents
+  // or tests against is pure attack surface with no offsetting benefit --
+  // and it was already the one inconsistency between this file and
+  // PanelState.qml's wlCopyPath/wlPastePath, which have never had an
+  // equivalent PATH-lookup fallback. `Cli.wrapViaPath()`/
+  // `Cli.isPathLookupCandidate()` are NOT deleted -- they remain a real,
+  // tested (tests/backend.qmltest.qml's "path-lookup" scenario, driven by
+  // explicitly overriding `binaryCandidates` on a Backend instance) opt-in
+  // mechanism, so a future, actually-supported non-standard install
+  // location can still be wired up deliberately (e.g. a
+  // shell.json-configurable path, mirroring wlCopyPath/wlPastePath) without
+  // it being silently on-by-default for every install in the meantime.
   // Overridable so tests can point this at a fixture script instead of the
-  // real binary.
-  property var binaryCandidates: ["/usr/bin/otpclient-cli", "/usr/local/bin/otpclient-cli", "otpclient-cli"]
+  // real binary; no candidate here is ever built from database content.
+  property var binaryCandidates: ["/usr/bin/otpclient-cli", "/usr/local/bin/otpclient-cli"]
 
   // Hard wall-clock ceiling for one invocation, in milliseconds. Argon2id
   // at the CLI's default parameters measured ~0.22s against a real
@@ -212,7 +231,16 @@ Item {
   // is already in flight anywhere in this process.
   function requestCode(issuer, account, type) {
     if (String(type || "").toUpperCase() === "HOTP") {
-      console.warn("Backend.requestCode() refused for a HOTP entry (" + issuer + "/" + account + "); use requestHotpCode() explicitly -- it advances and persists the counter.")
+      // Issue #22: issuer/account are untrusted (otpauth:// import) content
+      // -- deliberately NOT interpolated into this message. The useful
+      // fact here is that a caller misused the API, not which specific
+      // entry it was about; a raw, attacker-influenced string reaching a
+      // log sink is exactly what issue #9's checklist rules out elsewhere
+      // ("nothing is logged that would leak ... an account list"), and
+      // this is otherwise the only console.* call anywhere in this
+      // plugin's otpclient-facing surface (verified: the only match for
+      // `console\.` outside tests/).
+      console.warn("Backend.requestCode() refused for a HOTP entry; use requestHotpCode() explicitly -- it advances and persists the counter.")
       return false
     }
     return root._requestShow(issuer, account)

@@ -38,7 +38,7 @@ cleanup() {
 trap cleanup EXIT
 
 cp "$REPO/Backend.qml" "$REPO/Cli.js" "$REPO/Shared.js" \
-   "$REPO/PanelState.qml" "$REPO/PanelLogic.js" \
+   "$REPO/PanelState.qml" "$REPO/PanelLogic.js" "$REPO/GuardedProcess.qml" \
    "$REPO/Widget.qml" "$REPO/Popup.qml" \
    "$DIR"/*.qmltest.qml \
    "$WORKDIR/"
@@ -126,8 +126,10 @@ run_one "backend.qmltest.qml" 25 || OVERALL=1
 
 # panel.qmltest.qml additionally waits out real countdown/confirm-gate
 # timers (a 3s reveal countdown, a 3s HOTP confirm auto-disarm, a 1s
-# clipboard-clear) on top of several sequential list/show round trips;
-# 40s leaves generous headroom over its ~9s typical wall time.
+# clipboard-clear) on top of several sequential list/show round trips, plus
+# (issue #20) two scenarios that let a clipboard-clear readback actually
+# hang against tests/fixtures/hang.sh before confirming it gets force-
+# stopped; 40s leaves generous headroom over its ~15s typical wall time.
 run_one "panel.qmltest.qml" 40 || OVERALL=1
 
 # widget-dock.qmltest.qml (issue #7): loads the real Widget.qml once and

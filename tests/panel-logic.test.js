@@ -345,6 +345,39 @@ test("clipboardStillOurs is false when the clipboard is empty", () => {
   assert(!Logic.clipboardStillOurs("", "482913"));
 });
 
+// ---- structural guard (issue #20) -----------------------------------------
+// PanelState.qml's clipboard machinery (copyProc/pasteProc/clearCopyProc)
+// used to be raw Quickshell.Io.Process instances with no timeout, no
+// watchdog, and no guaranteed secret cleanup -- the fourth appearance of
+// "a decrypted code outlives its intended window" in this plugin (see
+// GuardedProcess.qml's own header). Rather than trust that a future call
+// site remembers to add all three protections itself, every subprocess in
+// PanelState.qml now has to be a GuardedProcess (see that file's own
+// module header) -- this is a plain text check, needing no QML runtime,
+// that makes reverting to a raw `Process {` in PanelState.qml a red test
+// rather than a silent regression. GuardedProcess.qml itself legitimately
+// declares one raw `Process {' as ITS OWN implementation and is
+// deliberately not scanned here.
+test("PanelState.qml spawns every subprocess through GuardedProcess, never a raw Process", () => {
+  const panelStatePath = path.join(__dirname, "..", "PanelState.qml");
+  const panelStateSrc = fs.readFileSync(panelStatePath, "utf8");
+  // \b does not match between "d" and "P" in "GuardedProcess", so this
+  // only matches a standalone `Process {` declaration, never `GuardedProcess {`.
+  const rawProcessDecls = panelStateSrc.match(/\bProcess\s*\{/g) || [];
+  assertEqual(rawProcessDecls.length, 0,
+    "found a raw `Process {` declaration in PanelState.qml -- every subprocess here must be a GuardedProcess (see GuardedProcess.qml)");
+});
+
+test("GuardedProcess.qml exists and is the thing PanelState.qml's clipboard processes are declared as", () => {
+  const panelStatePath = path.join(__dirname, "..", "PanelState.qml");
+  const guardedProcessPath = path.join(__dirname, "..", "GuardedProcess.qml");
+  assert(fs.existsSync(guardedProcessPath), "GuardedProcess.qml is missing");
+  const panelStateSrc = fs.readFileSync(panelStatePath, "utf8");
+  const guardedDecls = panelStateSrc.match(/\bGuardedProcess\s*\{/g) || [];
+  assert(guardedDecls.length >= 3,
+    "expected at least 3 GuardedProcess declarations in PanelState.qml (copyProc/pasteProc/clearCopyProc), found " + guardedDecls.length);
+});
+
 // ---- report ---------------------------------------------------------
 
 console.log(pass + " passed, " + fail + " failed");

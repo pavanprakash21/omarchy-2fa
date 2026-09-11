@@ -831,6 +831,110 @@ Item {
     })
   }
 
+  // ==== Group R: pasteProc's own timeout+watchdog (issue #20) -- a hung
+  // wl-paste must not be left running forever, holding the plaintext code
+  // it was about to compare against the clipboard, in `pasteProc.secret`.
+  // Mirrors Backend.qml's own hang scenario (tests/fixtures/hang.sh) at
+  // THIS file's separate clipboard-clear call site -- the fourth
+  // appearance of "a decrypted code is retained longer than intended" (see
+  // PanelState.qml's own module header), and the one GuardedProcess.qml
+  // exists specifically to make impossible to reintroduce a fifth time.
+  // clipboardTimeoutMs is set well below hang.sh's own 30s sleep, so only
+  // GuardedProcess's own `timeout -s KILL`/watchdog -- never the fixture
+  // exiting on its own -- can be what ends this.
+  PanelState {
+    id: hangPasteState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-capture.sh")
+    wlPastePath: root.fx("hang.sh")
+    clipboardClearSeconds: 1
+    clipboardTimeoutMs: 500
+  }
+
+  function groupR() {
+    hangPasteState.open()
+    root.waitUntil(function () { return hangPasteState.loadState !== "loading" }, 3000, function () {
+      hangPasteState.moveSelection(1) // Example/alice -- validity_seconds: 25, long enough to outlive this
+      hangPasteState.activateSelected()
+      root.waitUntil(function () { return hangPasteState.revealState === "revealed" }, 3000, function () {
+        // clipboardClearSeconds (1s) starts the hung wl-paste; wait well
+        // past clipboardTimeoutMs (500ms) PLUS the watchdog's own +2s
+        // margin, so both the OS-level `timeout -s KILL` and, if that
+        // somehow failed, GuardedProcess's own watchdog Timer have had
+        // every chance to end it.
+        root.sleep(1000 + 500 + 2500, function () {
+          var g = hangPasteState.__debugClipboardGuardState()
+          root.check("R: a hung wl-paste is force-stopped, not left running forever (the process-orphan half of issue #20)",
+            g.pasteProcRunning === false)
+          root.check("R: THE BUG BEING REGRESSION-TESTED -- no plaintext code is left staged in pasteProc.secret once the hang is handled",
+            g.pasteProcSecret === "")
+          root.runNext()
+        })
+      })
+    })
+  }
+
+  // ==== Group S: clearReveal() is authoritative over the clipboard-clear
+  // readback (issue #20's second requirement) -- a reveal that's already
+  // been dropped (here: an explicit close()) must not leave an in-flight
+  // (or hung) wl-paste holding the code for even one more moment, rather
+  // than waiting out its own timeout+watchdog window. clipboardTimeoutMs
+  // is deliberately set far longer than this whole test, so a pass here
+  // can only be explained by clearReveal() itself doing the stopping, not
+  // GuardedProcess's watchdog winning some race.
+  PanelState {
+    id: authClearState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-capture.sh")
+    wlPastePath: root.fx("hang.sh")
+    clipboardClearSeconds: 1
+    clipboardTimeoutMs: 5000
+  }
+
+  function groupS() {
+    authClearState.open()
+    root.waitUntil(function () { return authClearState.loadState !== "loading" }, 3000, function () {
+      authClearState.moveSelection(1) // Example/alice, validity_seconds: 25
+      authClearState.activateSelected()
+      root.waitUntil(function () { return authClearState.revealState === "revealed" }, 3000, function () {
+        // Wait past clipboardClearSeconds (1s) plus a moment for the hung
+        // fixture to actually start, so the readback is confirmed in
+        // flight -- well short of its own deliberately-long 5s timeout --
+        // before we act.
+        root.sleep(1500, function () {
+          var before = authClearState.__debugClipboardGuardState()
+          root.check("S: the hung readback is actually in flight before we act",
+            before.pasteProcRunning === true && before.pasteProcSecret.length > 0)
+
+          authClearState.close() // calls clearReveal()
+          // `secret` is plain JS state GuardedProcess.stop() blanks
+          // directly, so this part IS synchronous -- no wait needed, and
+          // this is the actual bug being regression-tested (a stale
+          // plaintext code left in pasteProc.secret after the reveal was
+          // already dropped).
+          var afterClose = authClearState.__debugClipboardGuardState()
+          root.check("S: THE BUG BEING REGRESSION-TESTED -- clearReveal() blanks the staged plaintext code SYNCHRONOUSLY, without waiting for its own timeout",
+            afterClose.pasteProcSecret === "")
+
+          // `running` reflects the underlying QProcess's own termination,
+          // which Quickshell resolves asynchronously (the kill request
+          // stop() issues is synchronous; the process actually reporting
+          // back that it's gone is not) -- so confirm it dies SOON, well
+          // under clipboardTimeoutMs (5s) + the watchdog's own margin
+          // (7s total), rather than asserting it's already false this
+          // same tick.
+          root.waitUntil(function () { return authClearState.__debugClipboardGuardState().pasteProcRunning === false }, 2000, function (stopped) {
+            root.check("S: close()/clearReveal() force-stops the in-flight readback promptly, without waiting for its own timeout",
+              stopped)
+            root.runNext()
+          })
+        })
+      })
+    })
+  }
+
   Component.onCompleted: {
     root.steps = [
       root.groupA,
@@ -849,7 +953,9 @@ Item {
       root.groupN,
       root.groupO,
       root.groupP,
-      root.groupQ
+      root.groupQ,
+      root.groupR,
+      root.groupS
     ]
     root.runNext()
   }

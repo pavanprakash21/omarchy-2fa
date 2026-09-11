@@ -187,7 +187,7 @@ database secret in the text:
 
 | What you'll see | What it means | The fix |
 |---|---|---|
-| "otpclient isn't installed…" | `otpclient-cli` isn't on PATH | `otpclient` is AUR-only: `yay -S otpclient` |
+| "otpclient isn't installed…" | `otpclient-cli` isn't at `/usr/bin` or `/usr/local/bin` (checked directly; no PATH lookup, per this plugin's own threat model — see issue #21) | `otpclient` is AUR-only: `yay -S otpclient`, which installs to `/usr/bin` |
 | "Secret Service integration is off…" | otpclient-cli is blocked on a password prompt this panel can't answer — the most likely first-run state | Enable "Use Secret Service" in OTPClient's own preferences |
 | "password… is stale or wrong" | The keyring entry needs refreshing | Unlock the database once in the OTPClient GUI |
 | "No OTPClient database found…" | Nothing configured at the expected path | Set one up in the OTPClient GUI, or check `~/.config/otpclient/otpclient.cfg` |
