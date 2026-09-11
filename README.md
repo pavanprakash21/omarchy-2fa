@@ -4,6 +4,10 @@ Bar widget for [Omarchy](https://omarchy.org/) that reveals and copies a
 TOTP/HOTP code from your [OTPClient](https://github.com/paolostivanin/OTPClient)
 database, on demand.
 
+![The 2FA panel: a search box filtered to "twit", one matching row showing
+Twitter, "TOTP code copied · 19s remaining", and the code itself masked
+behind bullets](preview.png)
+
 ## What it does
 
 The bar icon opens a searchable panel listing every issuer/account in your
