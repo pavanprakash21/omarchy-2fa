@@ -264,7 +264,7 @@ Item {
           root.check("C: HOTP code matches the fixture", hotpState.revealedEntry && hotpState.revealedEntry.current === "999111")
           root.check("C: HOTP counter is surfaced", hotpState.revealedEntry.counter === 11)
           root.check("C: HOTP has no CLI-reported expiry -- the fixed fallback window is used, not a fabricated period",
-            hotpState.revealedEntry.secondsRemaining === hotpState.hotpRevealFallbackSeconds)
+            hotpState.revealedEntry.secondsRemaining === hotpState.revealSeconds)
           root.check("C: the fallback countdown is flagged as such, distinct from a real expiry", hotpState.revealCountdownIsFallback === true)
           hotpState.close()
           root.runNext()
@@ -591,6 +591,246 @@ Item {
     }
   }
 
+  // ==== Group L: a manual refresh() must not leave a stale reveal attached
+  // to a DIFFERENT entry that lands on the same numeric selectedIndex --
+  // found by a SECOND adversarial review pass, after the moveSelection()/
+  // click-path fix in Group H had already landed for the same bug class.
+  // onListSucceeded is reachable via refresh() ALONE (Popup.qml's refresh
+  // button calls state.refresh() directly, not open(), which resets
+  // selectedIndex to -1 first) -- a clamp that lands on the SAME NUMBER
+  // while the underlying --list order changed underneath it never fires
+  // onSelectedIndexChanged, so without an explicit _syncRevealToSelection()
+  // call from onListSucceeded itself, a stale reveal for the OLD entry
+  // would survive the refresh. See panel-reorder.sh for the fixture that
+  // makes the inventory order actually change between two --list calls.
+  PanelState {
+    id: reorderState
+    binaryCandidates: [root.fx("panel-reorder.sh")]
+    timeoutMs: 3000
+  }
+
+  function groupL() {
+    reorderState.open()
+    root.waitUntil(function () { return reorderState.loadState !== "loading" }, 3000, function () {
+      root.check("L: first load has GitHub at index 0", reorderState.entries[0] && reorderState.entries[0].issuer === "GitHub")
+
+      reorderState.activateSelected() // GitHub, TOTP -- reveals directly, no confirm needed
+      root.waitUntil(function () { return reorderState.revealState === "revealed" }, 3000, function () {
+        root.check("L: GitHub is revealed before the refresh", reorderState.revealedEntry && reorderState.revealedEntry.issuer === "GitHub")
+
+        reorderState.refresh() // fixture's SECOND --list call: reordered, Bank now at index 0
+        root.waitUntil(function () {
+          return reorderState.loadState === "ok" && reorderState.entries.length === 3 && reorderState.entries[0].issuer === "Bank"
+        }, 3000, function (ok) {
+          root.check("L: refresh() loaded the reordered inventory", ok)
+          root.check("L: selectedIndex stayed at the SAME NUMBER across the refresh", reorderState.selectedIndex === 0)
+          root.check("L: ...but that number now denotes a DIFFERENT entry (Bank, not GitHub)",
+            reorderState.selectedEntry && reorderState.selectedEntry.issuer === "Bank")
+          root.check("L: THE BUG BEING REGRESSION-TESTED -- a stale reveal for the OLD entry must not survive a reordering refresh()",
+            reorderState.revealState === "idle" && reorderState.revealedEntry === null)
+          root.runNext()
+        })
+      })
+    })
+  }
+
+  // ==== Group M: revealSeconds (#8) governs ONLY this panel's own fallback
+  // auto-clear window (used whenever otpclient-cli reports no expiry at
+  // all -- always true for HOTP) -- and must never touch a REAL
+  // CLI-reported TOTP countdown. Group B already proves the TOTP side
+  // (validity_seconds: 3 comes through unchanged with revealSeconds at its
+  // default) -- this group is revealSeconds' own settings test: the
+  // default value, and that an override demonstrably changes the fallback.
+  PanelState {
+    id: defaultRevealSecondsState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+  }
+  PanelState {
+    id: customRevealSecondsState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    revealSeconds: 2
+  }
+
+  function groupM() {
+    root.check("M: revealSeconds' own bare default is 5 (issue #8)", defaultRevealSecondsState.revealSeconds === 5)
+    defaultRevealSecondsState.open()
+    root.waitUntil(function () { return defaultRevealSecondsState.loadState !== "loading" }, 3000, function () {
+      defaultRevealSecondsState.moveSelection(2) // Bank/HOTP
+      var armed = defaultRevealSecondsState.activateSelected()
+      var confirmed = defaultRevealSecondsState.activateSelected()
+      root.check("M: HOTP arm+confirm accepted", armed === true && confirmed === true)
+      root.waitUntil(function () { return defaultRevealSecondsState.revealState === "revealed" }, 3000, function () {
+        root.check("M: with no override, the HOTP fallback window uses the documented default (5)",
+          defaultRevealSecondsState.revealedEntry.secondsRemaining === 5)
+
+        customRevealSecondsState.open()
+        root.waitUntil(function () { return customRevealSecondsState.loadState !== "loading" }, 3000, function () {
+          customRevealSecondsState.moveSelection(2) // Bank/HOTP
+          customRevealSecondsState.activateSelected()
+          customRevealSecondsState.activateSelected()
+          root.waitUntil(function () { return customRevealSecondsState.revealState === "revealed" }, 3000, function () {
+            root.check("M: an explicit revealSeconds override (2) DEMONSTRABLY changes the fallback window",
+              customRevealSecondsState.revealedEntry.secondsRemaining === 2)
+            root.runNext()
+          })
+        })
+      })
+    })
+  }
+
+  // ==== Group N: maskCodes (#8) -- issue #8 documents this setting's
+  // default as `true`, SUPERSEDING issue #5's original "show what was just
+  // copied" default (see PanelState.qml's maskRevealedCode docstring).
+  // Omitting the setting entirely must still mask on screen by default;
+  // an explicit override must still be able to show plaintext, so the new
+  // default doesn't quietly become the only option.
+  PanelState {
+    id: defaultMaskState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-capture.sh")
+    wlPastePath: root.fx("wl-paste-readback.sh")
+    // maskRevealedCode deliberately left unset -- exercising the bare
+    // property default, the same one a widget with no shell.json entry at
+    // all gets from Widget.qml's setting("maskCodes", true).
+  }
+  PanelState {
+    id: unmaskedOverrideState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    wlCopyPath: root.fx("wl-copy-capture.sh")
+    wlPastePath: root.fx("wl-paste-readback.sh")
+    maskRevealedCode: false
+  }
+
+  function groupN() {
+    root.check("N: maskRevealedCode's own bare default is true (issue #8)", defaultMaskState.maskRevealedCode === true)
+    defaultMaskState.open()
+    root.waitUntil(function () { return defaultMaskState.loadState !== "loading" }, 3000, function () {
+      defaultMaskState.activateSelected()
+      root.waitUntil(function () { return defaultMaskState.revealState === "revealed" }, 3000, function () {
+        root.check("N: with no setting at all, a reveal is masked on screen by default", defaultMaskState.codeMaskedOnScreen === true)
+
+        unmaskedOverrideState.open()
+        root.waitUntil(function () { return unmaskedOverrideState.loadState !== "loading" }, 3000, function () {
+          unmaskedOverrideState.activateSelected()
+          root.waitUntil(function () { return unmaskedOverrideState.revealState === "revealed" }, 3000, function () {
+            root.check("N: an explicit maskCodes: false override DEMONSTRABLY shows the code unmasked",
+              unmaskedOverrideState.codeMaskedOnScreen === false)
+            root.runNext()
+          })
+        })
+      })
+    })
+  }
+
+  // ==== Group O: confirmHotp (#8) must NEVER be able to turn the HOTP =====
+  // confirm gate fail-open, even when explicitly set to false -- see
+  // PanelState.qml's confirmHotp/activateSelected() docstrings for why
+  // this is a deliberate design decision, not an oversight left for #8.
+  PanelState {
+    id: confirmHotpFalseState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+    confirmHotp: false
+  }
+
+  function groupO() {
+    confirmHotpFalseState.open()
+    root.waitUntil(function () { return confirmHotpFalseState.loadState !== "loading" }, 3000, function () {
+      confirmHotpFalseState.moveSelection(2) // Bank/HOTP
+      root.check("O: confirmHotp is readable and really is false on this instance", confirmHotpFalseState.confirmHotp === false)
+
+      var firstActivate = confirmHotpFalseState.activateSelected()
+      root.check("O: THE SAFETY PROPERTY BEING TESTED -- confirmHotp: false still ARMS the gate rather than revealing immediately",
+        firstActivate === true)
+      root.check("O: it did NOT reveal unconfirmed despite confirmHotp: false -- the gate is not fail-open",
+        confirmHotpFalseState.revealState === "idle")
+      root.check("O: the gate is armed for this row exactly as if confirmHotp were true",
+        confirmHotpFalseState.hotpConfirmKey === root.bankKey())
+
+      var confirmed = confirmHotpFalseState.activateSelected()
+      root.check("O: the deliberate second activation still works normally", confirmed === true)
+      root.waitUntil(function () { return confirmHotpFalseState.revealState !== "loading" }, 3000, function (ok) {
+        root.check("O: only after confirming does it actually reveal", ok && confirmHotpFalseState.revealState === "revealed")
+        root.runNext()
+      })
+    })
+  }
+
+  // ==== Group P: a --show-time failure is surfaced ON THE ROW it belongs
+  // to (issue #6: "errors are surfaced in-panel"), mapped through
+  // PanelLogic.degradedStateMessage() for an actionable message rather
+  // than raw Backend/Cli.js text -- and dropped the moment the selection
+  // moves off that row, same discipline as every other per-row reveal
+  // field (_syncRevealToSelection()).
+  PanelState {
+    id: showFailState
+    binaryCandidates: [root.fx("panel-show-bad-password.sh")]
+    timeoutMs: 3000
+  }
+
+  function groupP() {
+    showFailState.open()
+    root.waitUntil(function () { return showFailState.loadState !== "loading" }, 3000, function () {
+      root.check("P: selection starts on GitHub (TOTP, no confirm needed)",
+        showFailState.selectedEntry && showFailState.selectedEntry.issuer === "GitHub")
+      showFailState.activateSelected()
+      root.waitUntil(function () { return showFailState.revealState !== "loading" }, 3000, function () {
+        root.check("P: the reveal fails (the fixture always fails --show)", showFailState.revealState === "error")
+        root.check("P: the typed state is preserved for the error copy", showFailState.revealErrorState === "bad-password")
+        root.check("P: the failure is attributed to the SPECIFIC row it belongs to",
+          showFailState.isRevealFailedFor("GitHub", "pavan@smaply.com") === true)
+        root.check("P: it is NOT attributed to a different, uninvolved row",
+          showFailState.isRevealFailedFor("Bank", "acct1") === false)
+        root.check("P: the mapped, actionable message names the GUI re-unlock fix, not raw CLI text",
+          Logic.degradedStateMessage(showFailState.revealErrorState, "show", showFailState.revealErrorMessage).indexOf("OTPClient GUI") !== -1)
+
+        showFailState.moveSelection(1)
+        root.check("P: moving off the failed row clears it",
+          showFailState.isRevealFailedFor("GitHub", "pavan@smaply.com") === false && showFailState.revealState === "idle")
+        root.runNext()
+      })
+    })
+  }
+
+  // ==== Group Q: a reveal refused by the PROCESS-WIDE shared gate (a =====
+  // DIFFERENT PanelState's Backend instance already in flight -- see
+  // Shared.js) is ALSO surfaced on the row it belongs to, exactly like a
+  // real CLI-reported failure -- exercises _requestReveal()'s own
+  // synchronous refusal branch (the "busy" typed state), not onShowFailed's.
+  PanelState {
+    id: gateHolderState
+    binaryCandidates: [root.fx("slow-ok-list.sh")]
+    timeoutMs: 3000
+  }
+  PanelState {
+    id: gateWaiterState
+    binaryCandidates: [root.fx("panel-combo.sh")]
+    timeoutMs: 3000
+  }
+
+  function groupQ() {
+    gateWaiterState.open()
+    root.waitUntil(function () { return gateWaiterState.loadState !== "loading" }, 3000, function () {
+      root.check("Q: gateWaiterState has a valid selection before the gate is contended", gateWaiterState.selectedEntry !== null)
+
+      gateHolderState.refresh() // acquires the process-wide shared gate for ~300ms
+      var activated = gateWaiterState.activateSelected() // a DIFFERENT Backend instance -- refused by the shared gate
+      root.check("Q: activateSelected() is refused by the shared gate held by a DIFFERENT PanelState's Backend", activated === false)
+      root.check("Q: the refusal is surfaced as a reveal-time error, not silently swallowed", gateWaiterState.revealState === "error")
+      root.check("Q: the typed state is the synthetic busy state, not a CLI one", gateWaiterState.revealErrorState === "busy")
+      root.check("Q: it's attributed to the row that was actually activated",
+        gateWaiterState.isRevealFailedFor(gateWaiterState.entries[0].issuer, gateWaiterState.entries[0].account) === true)
+
+      root.waitUntil(function () { return gateHolderState.loadState !== "loading" }, 3000, function () {
+        root.runNext() // let the gate holder's own call finish before the next group starts
+      })
+    })
+  }
+
   Component.onCompleted: {
     root.steps = [
       root.groupA,
@@ -603,7 +843,13 @@ Item {
       root.groupH,
       root.groupI,
       root.groupJ,
-      root.groupK
+      root.groupK,
+      root.groupL,
+      root.groupM,
+      root.groupN,
+      root.groupO,
+      root.groupP,
+      root.groupQ
     ]
     root.runNext()
   }

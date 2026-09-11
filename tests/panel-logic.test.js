@@ -132,6 +132,103 @@ test("confirmPromptText does not claim an HOTP-specific consequence for an unrec
   assert(!/HOTP/.test(Logic.confirmPromptText(undefined)));
 });
 
+// ---- degradedStateMessage (issue #6) --------------------------------------
+// Every typed state Backend.qml/Cli.js can report (see their own docstrings)
+// must render its OWN distinct, actionable message -- one that names the
+// fix, not the symptom. Backend/Cli.js's own text (the `fallbackMessage`
+// argument) must never leak through for a state this function recognizes --
+// only for the unrecognized `default` case -- so a message here can never
+// echo something Backend/Cli.js read back from otpclient-cli.
+
+const ALL_KNOWN_STATES = [
+  "binary-missing", "would-prompt", "bad-password", "db-missing",
+  "malformed", "crashed", "instance-conflict", "busy", "empty"
+];
+
+test("degradedStateMessage renders a non-empty, distinct message for every known state", () => {
+  const seen = new Set();
+  for (const state of ALL_KNOWN_STATES) {
+    const msg = Logic.degradedStateMessage(state, "list", "raw backend text");
+    assert(typeof msg === "string" && msg.length > 0, "message for " + state + " must be non-empty");
+    assert(!seen.has(msg), "message for " + state + " must be distinct from every other state's -- got a duplicate: " + msg);
+    seen.add(msg);
+  }
+});
+
+test("degradedStateMessage: binary-missing names the AUR-only fix, not just the symptom", () => {
+  const msg = Logic.degradedStateMessage("binary-missing", "list", "otpclient-cli not found (checked: ...)");
+  assert(/AUR/i.test(msg), "must mention otpclient is AUR-only");
+  assert(/yay -S otpclient/.test(msg), "must give the actual install command");
+});
+
+test("degradedStateMessage: would-prompt names Secret Service, not just 'timed out'", () => {
+  const msg = Logic.degradedStateMessage("would-prompt", "list", "did not respond within 4000ms and was killed");
+  assert(/Secret Service/.test(msg), "must name Secret Service as the thing to enable");
+});
+
+test("degradedStateMessage: bad-password points at the OTPClient GUI re-unlock fix", () => {
+  const msg = Logic.degradedStateMessage("bad-password", "show", "Incorrect database password.");
+  assert(/OTPClient GUI/.test(msg), "must point at the GUI as the fix");
+});
+
+test("degradedStateMessage: db-missing points at the GUI's database setup and the config path", () => {
+  const msg = Logic.degradedStateMessage("db-missing", "list", "OTPClient database not found.");
+  assert(/OTPClient GUI/.test(msg));
+  assert(/otpclient\.cfg/.test(msg));
+});
+
+test("degradedStateMessage: malformed is reported plainly, offers no repair", () => {
+  const msg = Logic.degradedStateMessage("malformed", "list", "Could not parse otpclient-cli output.");
+  assert(/no automatic repair/i.test(msg));
+});
+
+test("degradedStateMessage: crashed is distinguished from a config problem", () => {
+  const msg = Logic.degradedStateMessage("crashed", "list", "otpclient-cli exited abnormally (signal death, exitCode=11)");
+  assert(/crashed/i.test(msg));
+  assert(!/Secret Service/.test(msg), "must not be confused with would-prompt's fix");
+});
+
+test("degradedStateMessage: instance-conflict names the OTPClient GUI as the likely, actionable cause", () => {
+  const msg = Logic.degradedStateMessage("instance-conflict", "list", "raw stderr fragment");
+  assert(/OTPClient GUI/.test(msg), "must call out the GUI being open -- the most actionable cause");
+  assert(/close/i.test(msg), "must say what to do about it");
+});
+
+test("degradedStateMessage: empty is context-sensitive -- a list-time empty differs from a show-time one", () => {
+  const listMsg = Logic.degradedStateMessage("empty", "list", "No entries in the database.");
+  const showMsg = Logic.degradedStateMessage("empty", "show", "No matching entry for that issuer/account.");
+  assert(listMsg !== showMsg, "list-empty and show-empty must not read identically");
+  assert(!/error/i.test(listMsg), "a list-time empty database is a neutral state, not an error");
+});
+
+test("degradedStateMessage: an unrecognized state falls back to the given message, not a blank string", () => {
+  assertEqual(Logic.degradedStateMessage("some-future-state", "list", "whatever Backend said"), "whatever Backend said");
+});
+
+test("degradedStateMessage: an unrecognized state with no fallback at all still returns something usable", () => {
+  const msg = Logic.degradedStateMessage("some-future-state", "list", "");
+  assert(typeof msg === "string" && msg.length > 0);
+});
+
+test("degradedStateMessage: NEVER echoes the raw fallback text for a state it recognizes -- issue #6's no-secret-echo requirement", () => {
+  // A real password/code/secret can only ever reach this function inside
+  // Backend/Cli.js's own `message` argument (fallbackMessage here) -- never
+  // as the `state` string itself, which is always one of the fixed,
+  // typed literals Backend.qml documents. Proving every KNOWN state's
+  // branch ignores fallbackMessage entirely proves structurally that this
+  // function can never launder something sensitive through, regardless of
+  // what Backend/Cli.js's own wording does in the future.
+  const canary = "SECRET-PASSWORD-OR-CODE-MUST-NOT-APPEAR";
+  for (const state of ALL_KNOWN_STATES) {
+    const msg = Logic.degradedStateMessage(state, "list", canary);
+    assert(msg.indexOf(canary) === -1, "state '" + state + "' must not echo the raw backend message");
+  }
+  for (const state of ALL_KNOWN_STATES) {
+    const msg = Logic.degradedStateMessage(state, "show", canary);
+    assert(msg.indexOf(canary) === -1, "state '" + state + "' (show context) must not echo the raw backend message");
+  }
+});
+
 // ---- entryKey -----------------------------------------------------------
 
 test("entryKey is stable for the same issuer/account", () => {
