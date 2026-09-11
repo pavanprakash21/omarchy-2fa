@@ -180,6 +180,38 @@ ente account add          # choose "auth" as the app
 ./contrib/ente-sync.sh
 ```
 
+### Running it on a schedule
+
+`contrib/systemd/` has a user timer if you would rather not remember:
+
+```
+install -Dm755 contrib/ente-sync.sh ~/.local/bin/ente-sync.sh
+install -Dm644 contrib/systemd/2fa-sync.{service,timer} -t ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now 2fa-sync.timer
+systemctl --user list-timers 2fa-sync.timer    # confirm it is scheduled
+systemctl --user start 2fa-sync.service        # run once now, to prove it works
+```
+
+Daily, `Persistent=true` so a missed day is caught up after boot rather than
+skipped, and pinned to `graphical-session.target` because the Secret Service
+keyring has to be unlocked for the import to authenticate.
+
+**Understand the trade before enabling it.** Run by hand, the moment your
+secrets exist in plaintext is a moment you are present for. On a timer it
+happens unattended. The exposure is the same few hundred milliseconds in
+`/dev/shm`, but nobody is watching it. That is a reasonable trade for
+convenience; it is not a free one.
+
+Because an unattended failure would otherwise be silent — leaving the widget
+serving codes for tokens you have since changed — `--quiet` runs send a
+desktop notification on failure rather than only writing to the journal.
+
+```
+systemctl --user status 2fa-sync.service
+journalctl --user -u 2fa-sync.service -n 20
+```
+
 Run it after adding or removing a token in Ente. It is deliberately a command
 you run, not a daemon — a background job holding your whole 2FA vault open on a
 timer is a worse trade than typing one command occasionally. Re-running it is

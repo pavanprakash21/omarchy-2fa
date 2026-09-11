@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh the OTPClient database from Ente Auth, daily
+Documentation=https://github.com/pavanprakash21/omarchy-2fa
+
+[Timer]
+# Daily is the right order of magnitude: tokens are added rarely, and every
+# run briefly decrypts the whole vault. More often buys nothing and widens
+# the window.
+OnCalendar=daily
+# Catch up after the machine was off, rather than silently skipping a day.
+Persistent=true
+# Avoid every machine syncing at exactly midnight.
+RandomizedDelaySec=30m
+AccuracySec=5m
+
+[Install]
+WantedBy=timers.target

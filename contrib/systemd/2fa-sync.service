@@ -1,0 +1,22 @@
+[Unit]
+Description=Refresh the OTPClient database from Ente Auth
+Documentation=https://github.com/pavanprakash21/omarchy-2fa
+# The sync needs the Secret Service keyring unlocked to read the OTPClient
+# database password, and the keyring is tied to the desktop session -- so
+# this is pinned to the graphical session rather than run at boot.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ente-sync.sh --quiet
+
+# The script stages plaintext in /dev/shm for a moment. Keep that exposure as
+# narrow as the unit can make it.
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# A sync that cannot finish promptly is a sync holding a decrypted vault open.
+TimeoutStartSec=120
