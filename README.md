@@ -4,15 +4,68 @@ Bar widget for [Omarchy](https://omarchy.org/) that reveals and copies a
 TOTP/HOTP code from your [OTPClient](https://github.com/paolostivanin/OTPClient)
 database, on demand.
 
-## Status
+## What it does
 
-v1.0 (on-demand reveal): the bar icon opens a searchable panel listing every
-issuer/account in your OTPClient database. Select a row (mouse or keyboard)
-to decrypt just that one token, copy its code to the clipboard, and see it
-on screen for a few seconds. Nothing is decrypted until you ask for it, and
-never more than one code is held in memory at a time. Follow the
-[milestone](https://github.com/pavanprakash21/omarchy-2fa/milestones) for
-what's still ahead (settings, richer error copy).
+The bar icon opens a searchable panel listing every issuer/account in your
+OTPClient database. Select a row (mouse or keyboard) to decrypt just that
+one token, copy its code to the clipboard, and see it on screen for a few
+seconds. Nothing is decrypted until you ask for it, and never more than one
+code is held in memory at a time.
+
+### Why revealing a code takes a moment
+
+Decrypting **any** code from your OTPClient database means running its
+Argon2id key derivation (t=4, m=128 MiB, p=4) — that's deliberately slow,
+because it's the same thing standing between an attacker and your secrets
+if the database file leaks. Measured on real hardware, one derivation
+takes **~0.22s**. That's the pause you see between activating a row and the
+code landing on your clipboard; it's the KDF doing its job, not a bug or a
+slow widget.
+
+This is also why the panel does not show a live grid of every code at
+once: keeping a grid current means re-deriving the key for every single
+token roughly every 30 seconds, forever, just so a code is on screen in
+case you look at it. Instead, opening the panel costs exactly **one**
+Argon2id decrypt to list issuers/accounts (no codes, just names — the
+`--list` inventory call), and revealing a code costs exactly one more,
+scoped to the single row you clicked. One decrypt per code you actually
+ask for, never a background refresh loop.
+
+Follow the [milestone](https://github.com/pavanprakash21/omarchy-2fa/milestones)
+for what's still ahead.
+
+## Requirements
+
+- Omarchy on Hyprland (Wayland).
+- [`OTPClient`](https://github.com/paolostivanin/OTPClient), **from the AUR**
+  — it is not in `extra`:
+  ```
+  yay -S otpclient
+  ```
+  with a default database already configured (via the OTPClient GUI, or
+  `otpclient-cli --import`). Nothing here creates a database for you.
+- **Secret Service enabled in OTPClient.** Open OTPClient's own preferences
+  and turn on "Use Secret Service integration", then unlock your database
+  once so the password is stored in your keyring. Without this,
+  `otpclient-cli` blocks on a stdin password prompt this panel cannot
+  answer, and every reveal ends up in the `would-prompt` state instead of a
+  code — **this is the single most common first-run problem**; see
+  [If something's not working](#if-somethings-not-working) below.
+- `wl-clipboard` (`wl-copy`/`wl-paste`) for the clipboard copy.
+
+## Install
+
+```
+omarchy plugin add https://github.com/pavanprakash21/omarchy-2fa.git --enable
+```
+
+Or by hand:
+
+```
+git clone https://github.com/pavanprakash21/omarchy-2fa.git ~/.config/omarchy/plugins/pavanprakash21.twofa
+omarchy-shell shell rescanPlugins
+omarchy plugin enable pavanprakash21.twofa
+```
 
 ## Use
 
@@ -65,21 +118,29 @@ widget's own tunables live:
 | `maskCodes` | `true` | Mask a revealed code on screen until you click it to reveal. The clipboard copy always happens regardless of this — masking only ever affects what's painted on screen. |
 | `revealSeconds` | `5` | How long a code auto-clears from the panel when otpclient-cli itself gives no expiry to count down (always true for HOTP). A TOTP code's own real, CLI-reported countdown is never shortened or lengthened by this — only the panel's own fallback window is. |
 | `clipboardClearSeconds` | `0` | Clear the clipboard this many seconds after a copy, but only if it still holds the exact code this panel put there — a copy you made yourself in the meantime is left alone. `0` disables this entirely. |
-| `database` | `""` | Passed through to `--database`. **Not yet wired** — see below; the default (unset) is today's existing, unaffected behavior. |
+| `database` | `""` | Which OTPClient database to read, passed through to `--database`. Accepts either a path or a database *name* as printed by `otpclient-cli --list-databases`. Unset (the default) means no `--database` argument at all, i.e. your configured default database. |
 | `icon` | a lock/shield glyph | Override the bar (and dock) icon glyph. |
 | `confirmHotp` | `true` | Accepted, but **cannot be disabled** — see below. |
 
-### `database` isn't wired yet
+### Pointing at a non-default database
 
-`otpclient-cli` is deliberately never given a `-d/--database` argument by
-this plugin today (an already-reviewed decision from issue #2: it only ever
-talks to your already-configured default database). Actually honoring an
-override here means adding that argument to `Backend.qml`/`Cli.js`, both of
-which are a separately owned, already twice-reviewed layer outside the
-scope of the settings work that added this key. Leaving `database` unset —
-the default, `""` — is exactly today's existing behavior, so nothing
-regresses; setting it to a real path currently has no effect. Tracked as a
-follow-up.
+If you keep more than one OTPClient database, set `database` to the one this
+panel should read:
+
+```json
+"database": "/home/you/.config/otpclient/work.db"
+```
+
+The value is handed to `otpclient-cli -d/--database` verbatim as a single
+argument, so both forms that flag accepts work — an absolute path, or a
+database name as listed by `otpclient-cli --list-databases`. It applies to
+the token list and to every reveal alike, so the panel can never end up
+listing one database and decrypting from another.
+
+Leaving it unset passes no `--database` argument at all, which is the
+default-database behavior described everywhere else in this file. A value
+pointing at a database that doesn't exist surfaces as the same "database
+not found" state as any other missing database, not as a parse error.
 
 ### `confirmHotp` cannot be disabled
 
@@ -93,7 +154,30 @@ exactly the case you can least afford to guess wrong about. `confirmHotp`
 is accepted in `shell.json` — so the key doesn't just silently vanish — but
 setting it to `false` has no effect: the panel still requires a deliberate
 second activation before any HOTP-shaped counter is ever allowed to
-advance.
+advance. This is deliberate: a setting must never be able to fail-open the
+one gate standing between a click and an irreversible counter advance.
+
+## Security
+
+- **In memory:** never more than one decrypted code at a time, and only for
+  as long as it's on screen — it's overwritten the next time you reveal a
+  different row, and cleared outright when the panel closes. Nothing is
+  cached, and nothing is ever written to disk by this plugin.
+- **Clipboard:** the revealed code is piped to `wl-copy` over **stdin**,
+  never passed as a command-line argument — argv is world-readable via
+  `/proc/<pid>/cmdline` on Linux, stdin is not.
+- **Optional clipboard clear:** set `clipboardClearSeconds` (see
+  [Settings](#settings)) to have the plugin clear the clipboard N seconds
+  after a copy. It only clears if the clipboard still holds the exact code
+  it put there — reading it back first via `wl-paste` — so it never wipes
+  out something you copied yourself in the meantime.
+- **HOTP caveat:** `otpclient-cli --show` on an HOTP entry **advances and
+  persists that token's counter on disk** as a side effect of simply
+  reading the code — it is not a safe, idempotent "peek". Doing this by
+  accident desynchronizes the token from whatever server checks it. That's
+  why HOTP (and any non-`TOTP`-typed) row requires a deliberate second
+  activation to actually reveal — see [Use](#use) and
+  [`confirmHotp` cannot be disabled](#confirmhotp-cannot-be-disabled).
 
 ## If something's not working
 
@@ -131,7 +215,7 @@ of `omarchy.*` ids and has no notion of third-party plugins, even though the
 dock is fully capable of hosting one. Until that's fixed upstream, add this
 plugin to the dock by hand:
 
-1. Enable this plugin normally first (see Install, below) — the dock only
+1. Enable this plugin normally first (see Install, above) — the dock only
    resolves ids for plugins that are actually installed.
 2. Edit `~/.config/omarchy/dock-settings.json` and add
    `"pavanprakash21.twofa"` to the `dockWidgets` array, e.g.:
@@ -150,28 +234,23 @@ Everything else — the panel opening in the right place, the icon glyph, the
 open/close/toggle lifecycle — works the same whether the icon lives in the
 bar or the dock, on any screen edge the dock is docked to.
 
-## Requirements
-
-- Omarchy on Hyprland (Wayland).
-- [`OTPClient`](https://github.com/paolostivanin/OTPClient)'s `otpclient-cli`,
-  with a default database already configured (via the OTPClient GUI, or
-  `otpclient-cli --import`). Nothing here creates a database for you.
-- `wl-clipboard` (`wl-copy`/`wl-paste`) for the clipboard copy.
-
-## Install
-
-```
-omarchy plugin add https://github.com/pavanprakash21/omarchy-2fa.git --enable
-```
-
-Or by hand:
-
-```
-git clone https://github.com/pavanprakash21/omarchy-2fa.git ~/.config/omarchy/plugins/pavanprakash21.twofa
-omarchy-shell shell rescanPlugins
-omarchy plugin enable pavanprakash21.twofa
-```
+**`shell.json` settings only take effect in the bar, not the dock.** When
+the dock hosts a widget it injects `bar`, `shell`, `widgetId`, and
+`moduleName` into it (`DockPanel.qml`'s `configureHostedWidget()`), but it
+never sets the widget's `settings` property the way the real bar host does
+(`Bar.qml` reads each widget's `shell.json` entry and assigns it there) —
+so `setting(name, fallback)` always returns its fallback while hosted in
+the dock, regardless of what you've configured. This is a dock limitation,
+not something this plugin can work around from its side; every entry in
+the [Settings](#settings) table above behaves as its documented default
+when this widget lives in the dock.
 
 ## License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE).
+GPL-3.0-or-later, see [LICENSE](LICENSE). This plugin is built entirely
+against, and only makes sense alongside,
+[OTPClient](https://github.com/paolostivanin/OTPClient), which is itself
+GPL-3.0. It ships no code from OTPClient and only ever talks to it through
+`otpclient-cli`'s command-line/JSON interface — but it exists to be a front
+end for that tool, shares its lineage, and inherits its license rather than
+picking a different one.
