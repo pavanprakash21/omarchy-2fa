@@ -1,40 +1,120 @@
 import QtQuick
-import Quickshell
-import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 import "PanelLogic.js" as Logic
 
-// Popup.qml -- the 2FA panel's visual layer (issues #4/#5). A plain
-// PopupWindow anchored to the bar icon, dismissed by HyprlandFocusGrab --
-// the same shape as zeru.portwatch/PortsPopup.qml, per issue #4's explicit
-// direction, rather than the heavier first-party KeyboardPanel
-// (PanelWindow + layer-shell) some built-in plugins use.
+// Popup.qml -- the 2FA panel's visual layer (issues #4/#5), rebuilt on
+// qs.Ui's KeyboardPanel to fix issue #26.
 //
-// Everything stateful lives in PanelState.qml (`state`, injected by
+// WAS a plain PopupWindow (xdg-popup), dismissed via HyprlandFocusGrab --
+// the shape zeru.portwatch/PortsPopup.qml uses, per issue #4's explicit
+// (but, issue #26 found, mistaken) citation of it as the reference
+// implementation. portwatch's popup is mouse-only; it has no keyboard
+// handling at all, so it was never actually exercising the one thing this
+// panel has a HARD requirement for (issue #4: "every action is reachable
+// from the keyboard alone").
+//
+// The bug (#26): an xdg-popup only ever receives compositor keyboard focus
+// after a click/hover routes it through the parent surface. This popup's
+// old onOpenChanged called searchField.forceActiveFocus() unconditionally,
+// which sets Qt's own internal "which item gets the next key event WITHIN
+// this surface" pointer -- but the Wayland *surface itself* never held
+// compositor keyboard focus at all until the user had already clicked
+// something. Typing before that first click did nothing; paste (which has
+// no "an arrow key sometimes accidentally routes focus" fallback the way
+// clicking elsewhere in the panel did) never worked, full stop.
+//
+// Fix: root element here IS qs.Ui's KeyboardPanel, not a hand-rolled
+// PopupWindow. KeyboardPanel exists precisely for "click-driven AND
+// keyboard-driven panels" (its own header comment) and already solves the
+// focus problem with a brief WlrKeyboardFocus.Exclusive prime on every
+// open (both first map and re-open-while-fading-out), handing off to
+// OnDemand once primed -- see its header for exactly why Exclusive can't
+// just be left on permanently (it would break pointer routing to other
+// monitors). `focusTarget: searchField` below (KeyboardPanel's own
+// documented hook) replaces the old manual forceActiveFocus() call --
+// KeyboardPanel schedules it itself, via Qt.callLater, at the right point
+// in the surface's map lifecycle.
+//
+// This is the same component every built-in keyboard-driven panel already
+// uses (network, tailscale, agents, ...) -- not a novel construction.
+// PanelKeyCatcher (qs.Ui's companion key dispatcher for KeyboardPanel) is
+// deliberately NOT used here: this panel has exactly one focus owner the
+// entire time it's open (the search field itself -- there is no separate
+// "list navigation mode" to hand off from), so there is no scope in which
+// PanelKeyCatcher's Keys.priority: BeforeItem would ever legitimately win a
+// key over the field. Introducing it would only reproduce this exact bug
+// from the other direction (see PanelKeyCatcher.qml's own caveat: it must
+// be told `blocked: editor.activeFocus` whenever a panel's inline editor
+// should receive keys instead of the catcher) for zero benefit. Instead,
+// searchField keeps the same inline Keys.onPressed it already had, for
+// exactly the four keys issue #4/#26 require (Down/Up/Enter/Escape);
+// everything else -- letters, backspace, Ctrl+V paste -- falls through to
+// TextField's own default editing, which now actually receives it because
+// the surface holds real compositor focus. This mirrors how the built-in
+// tailscale panel's own inline Mullvad-region search field is built: an
+// explicit Keys.onPressed on the TextField for navigation keys, accepting
+// each one, rather than relying on the panel's outer PanelKeyCatcher for a
+// field that already owns focus.
+//
+// Also replaced by this rebuild, both intentionally:
+//  - Outside-click / Escape dismissal is now KeyboardPanel's own built-in
+//    mechanism (an overlay MouseArea plus per-output dismiss twins,
+//    routed through close()) instead of HyprlandFocusGrab. No built-in
+//    KeyboardPanel-based panel pairs it with HyprlandFocusGrab -- the two
+//    are alternative solutions to the same problem, not complementary.
+//    The user-visible contract (click away closes, Escape closes) is
+//    unchanged.
+//  - Popout coordination (bar.requestPopout/releasePopout, keyed by
+//    `owner || root`) and on-screen positioning for all four bar edges are
+//    now KeyboardPanel's own logic (the exact `owner || root` formula this
+//    file used to hand-roll, and the exact same per-edge anchoring math
+//    every other built-in KeyboardPanel panel already relies on) --
+//    removed here so open/close isn't coordinated twice for the same
+//    transition.
+//
+// Public API (anchorItem, bar, owner, open, state, the closeRequested
+// signal) is kept identical to the old PopupWindow-based file so
+// Widget.qml -- out of scope for this fix -- needs no changes:
+//  - anchorItem/bar/owner/open are inherited straight from KeyboardPanel
+//    now (same names, same meaning) rather than redeclared here.
+//  - closeRequested is kept as a declared-but-never-emitted compatibility
+//    signal purely so Widget.qml's existing `onCloseRequested: root.close()`
+//    handler still resolves. It's no longer load-bearing: KeyboardPanel's
+//    own close() already resolves through `owner` (Widget.qml passes
+//    owner: root, and BarWidget's root.close() sets popup.open = false
+//    directly), so Widget.qml's `opened: popup.open` binding already
+//    observes every close this file can produce without an explicit
+//    signal telling it to.
+//
+// Everything stateful still lives in PanelState.qml (`state`, injected by
 // Widget.qml) so it can be driven headlessly by tests/panel.qmltest.qml.
 // This file only paints `state`'s properties and forwards key/mouse input
 // to `state`'s functions -- it owns no otpclient-cli/wl-copy process, no
 // timer, and no copy of a decrypted code.
-PopupWindow {
+KeyboardPanel {
   id: root
 
-  required property Item anchorItem
-  required property QtObject bar
-  property var owner: null
   required property QtObject state
-  property bool open: false
 
+  // Compatibility no-op -- see header comment above.
   signal closeRequested()
 
-  readonly property var coordinatorKey: owner || root
-  readonly property var anchorWindow: anchorItem ? anchorItem.QsWindow.window : null
+  focusTarget: searchField
+  // Same nominal size the old PopupWindow used (360 wide, content-fit up to
+  // 440 tall) -- now additionally clamped to available screen space by
+  // KeyboardPanel's own fittedContentWidth/fittedContentHeight, which the
+  // old hand-rolled sizing never did.
+  contentWidth: root.fittedContentWidth(360)
+  contentHeight: root.fittedContentHeight(column.implicitHeight, 440)
 
   // ---- Theme tokens only -- issue #4's explicit list, plus the same
   // luminance guard zeru.portwatch/PortsPopup.qml applies for a light
   // popups.background a theme didn't separately tune popups.text for.
+  // KeyboardPanel's own card already paints Color.popups.background/border
+  // (its default `borderSpec`) -- these cover the token/text colors this
+  // file still renders itself.
   readonly property color bg: Color.popups.background
-  readonly property color borderColor: Color.popups.border
   readonly property color accent: Color.accent
   readonly property color muted: Color.muted
   readonly property color urgent: Color.urgent
@@ -44,268 +124,182 @@ PopupWindow {
   readonly property color safeMuted: luminance(bg) > 0.6 ? "#5a5a5a" : muted
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property int margin: 10
-  readonly property int cardPadding: 12
+  Column {
+    id: column
+    width: parent.width
+    spacing: 8
 
-  implicitWidth: 360
-  implicitHeight: Math.min(440, Math.max(220, content.implicitHeight + cardPadding * 2))
+    // ---- Header: title + refresh (mouse convenience; keyboard users get
+    // an equivalent refresh for free by closing and reopening the panel,
+    // since inventory always reloads on open -- issue #4).
+    Row {
+      width: parent.width
+      height: Math.max(titleText.implicitHeight, refreshBtn.height)
 
-  visible: open || card.opacity > 0
-  color: "transparent"
-
-  function close() { root.open = false; root.closeRequested() }
-
-  onOpenChanged: {
-    if (open) {
-      Qt.callLater(function () {
-        if (root.open) searchField.forceActiveFocus()
-      })
-    }
-    if (!bar) return
-    if (open) bar.requestPopout(coordinatorKey)
-    else if (bar.activePopout === coordinatorKey) bar.releasePopout(coordinatorKey)
-  }
-
-  // Clicking away or pressing Escape closes the panel -- issue #4's
-  // explicit requirement, same mechanism as
-  // zeru.portwatch/PortsPopup.qml:55-60.
-  HyprlandFocusGrab {
-    active: root.open
-    windows: root.anchorWindow ? [root, root.anchorWindow] : [root]
-    onCleared: root.close()
-  }
-
-  anchor {
-    id: popupAnchor
-    window: root.anchorWindow
-    adjustment: PopupAdjustment.Slide
-    edges: Edges.Top | Edges.Left
-    gravity: Edges.Bottom | Edges.Right
-    rect.width: 1
-    rect.height: 1
-
-    onAnchoring: {
-      if (!root.anchorItem || !root.bar || !root.anchorWindow) return
-
-      var target = root.anchorItem
-      var w = root.implicitWidth
-      var h = root.implicitHeight
-      var localX = target.width / 2 - w / 2
-      var localY = target.height + root.margin
-
-      if (root.bar.position === "bottom") {
-        localY = -h - root.margin
-      } else if (root.bar.position === "left") {
-        localX = target.width + root.margin
-        localY = target.height / 2 - h / 2
-      } else if (root.bar.position === "right") {
-        localX = -w - root.margin
-        localY = target.height / 2 - h / 2
+      Text {
+        id: titleText
+        textFormat: Text.PlainText
+        text: "2FA"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
+        width: parent.width - refreshBtn.width
+        anchors.verticalCenter: parent.verticalCenter
       }
 
-      var point = root.anchorWindow.contentItem.mapFromItem(target, localX, localY)
+      Item {
+        id: refreshBtn
+        width: 22
+        height: 22
+        anchors.verticalCenter: parent.verticalCenter
 
-      if (root.bar.position === "top" || root.bar.position === "bottom") {
-        point.x = Math.max(root.margin, Math.min(point.x, root.anchorWindow.width - w - root.margin))
-      } else {
-        point.y = Math.max(root.margin, Math.min(point.y, root.anchorWindow.height - h - root.margin))
+        Text {
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: "󰑐"
+          color: root.fg
+          font.family: root.fontFamily
+          font.pixelSize: 13
+          opacity: refreshArea.containsMouse ? 1 : 0.6
+        }
+
+        MouseArea {
+          id: refreshArea
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            root.state.refresh()
+            searchField.forceActiveFocus()
+          }
+        }
       }
-
-      popupAnchor.rect.x = Math.round(point.x)
-      popupAnchor.rect.y = Math.round(point.y)
     }
-  }
 
-  Rectangle {
-    id: card
-    anchors.fill: parent
-    radius: Style.cornerRadius
-    color: root.bg
-    border.color: root.borderColor
-    border.width: 2
-    opacity: root.open ? 1 : 0
+    // ---- Search / type-to-filter (issue #4). Up/Down/Enter/Escape are
+    // intercepted before the default TextField editing handles them; every
+    // other key (letters, backspace, Ctrl+V paste, ...) still edits the
+    // field normally. KeyboardPanel's `focusTarget: searchField` above
+    // (not a manual forceActiveFocus() here) is what makes typing/pasting
+    // work with no prior click -- see this file's header comment for why
+    // that distinction is the entire fix for issue #26.
+    TextField {
+      id: searchField
+      width: parent.width
+      placeholderText: "Search issuer or account…"
+      foreground: root.fg
+      accent: root.accent
 
-    Behavior on opacity {
-      NumberAnimation { duration: 130; easing.type: Easing.OutCubic }
+      onTextChanged: root.state.setFilterText(text)
+
+      Keys.onPressed: function (event) {
+        switch (event.key) {
+        case Qt.Key_Down:
+          root.state.moveSelection(1)
+          event.accepted = true
+          break
+        case Qt.Key_Up:
+          root.state.moveSelection(-1)
+          event.accepted = true
+          break
+        case Qt.Key_Return:
+        case Qt.Key_Enter:
+          root.state.activateSelected()
+          event.accepted = true
+          break
+        case Qt.Key_Escape:
+          if (root.state.hotpConfirmKey !== "") root.state.cancelHotpConfirm()
+          else root.close()
+          event.accepted = true
+          break
+        default:
+          break
+        }
+      }
+    }
+
+    // ---- Body: loading / empty / error / the row list. Exactly one of
+    // these is visible at a time, per issue #4's "loading, empty, and
+    // error states rendered inline" requirement.
+    Text {
+      width: parent.width
+      visible: root.state.loadState === "loading"
+      textFormat: Text.PlainText
+      text: "Decrypting your database…"
+      color: root.safeMuted
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      wrapMode: Text.WordWrap
+
+      SequentialAnimation on opacity {
+        running: root.state.loadState === "loading"
+        loops: Animation.Infinite
+        NumberAnimation { from: 1.0; to: 0.4; duration: 550; easing.type: Easing.InOutSine }
+        NumberAnimation { from: 0.4; to: 1.0; duration: 550; easing.type: Easing.InOutSine }
+      }
+    }
+
+    Text {
+      width: parent.width
+      visible: root.state.loadState === "empty"
+      textFormat: Text.PlainText
+      text: "No entries in your OTPClient database."
+      color: root.safeMuted
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      wrapMode: Text.WordWrap
     }
 
     Column {
-      id: content
-      anchors.fill: parent
-      anchors.margins: root.cardPadding
-      spacing: 8
-
-      // ---- Header: title + refresh (mouse convenience; keyboard users
-      // get an equivalent refresh for free by closing and reopening the
-      // panel, since inventory always reloads on open -- issue #4).
-      Row {
-        width: parent.width
-        height: Math.max(titleText.implicitHeight, refreshBtn.height)
-
-        Text {
-          id: titleText
-          textFormat: Text.PlainText
-          text: "2FA"
-          color: root.fg
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.title
-          font.bold: true
-          width: parent.width - refreshBtn.width
-          anchors.verticalCenter: parent.verticalCenter
-        }
-
-        Item {
-          id: refreshBtn
-          width: 22
-          height: 22
-          anchors.verticalCenter: parent.verticalCenter
-
-          Text {
-            anchors.centerIn: parent
-            textFormat: Text.PlainText
-            text: "󰑐"
-            color: root.fg
-            font.family: root.fontFamily
-            font.pixelSize: 13
-            opacity: refreshArea.containsMouse ? 1 : 0.6
-          }
-
-          MouseArea {
-            id: refreshArea
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              root.state.refresh()
-              searchField.forceActiveFocus()
-            }
-          }
-        }
-      }
-
-      // ---- Search / type-to-filter (issue #4). Up/Down/Enter/Escape are
-      // intercepted before the default TextField editing handles them;
-      // every other key (letters, backspace, ...) still edits the field
-      // normally, so typing filters the list without a separate "focus
-      // search" step -- the field already holds focus whenever the panel
-      // is open (see onOpenChanged above).
-      TextField {
-        id: searchField
-        width: parent.width
-        placeholderText: "Search issuer or account…"
-        foreground: root.fg
-        accent: root.accent
-
-        onTextChanged: root.state.setFilterText(text)
-
-        Keys.onPressed: function (event) {
-          switch (event.key) {
-          case Qt.Key_Down:
-            root.state.moveSelection(1)
-            event.accepted = true
-            break
-          case Qt.Key_Up:
-            root.state.moveSelection(-1)
-            event.accepted = true
-            break
-          case Qt.Key_Return:
-          case Qt.Key_Enter:
-            root.state.activateSelected()
-            event.accepted = true
-            break
-          case Qt.Key_Escape:
-            if (root.state.hotpConfirmKey !== "") root.state.cancelHotpConfirm()
-            else root.close()
-            event.accepted = true
-            break
-          default:
-            break
-          }
-        }
-      }
-
-      // ---- Body: loading / empty / error / the row list. Exactly one of
-      // these is visible at a time, per issue #4's "loading, empty, and
-      // error states rendered inline" requirement.
-      Text {
-        width: parent.width
-        visible: root.state.loadState === "loading"
-        textFormat: Text.PlainText
-        text: "Decrypting your database…"
-        color: root.safeMuted
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        wrapMode: Text.WordWrap
-
-        SequentialAnimation on opacity {
-          running: root.state.loadState === "loading"
-          loops: Animation.Infinite
-          NumberAnimation { from: 1.0; to: 0.4; duration: 550; easing.type: Easing.InOutSine }
-          NumberAnimation { from: 0.4; to: 1.0; duration: 550; easing.type: Easing.InOutSine }
-        }
-      }
+      width: parent.width
+      visible: root.state.loadState === "error"
+      spacing: 4
 
       Text {
         width: parent.width
-        visible: root.state.loadState === "empty"
         textFormat: Text.PlainText
-        text: "No entries in your OTPClient database."
-        color: root.safeMuted
+        // Names the fix, not the symptom (issue #6) -- mapped from the
+        // TYPED state Backend/Cli.js report (loadErrorState), never a raw
+        // Backend/Cli.js message string, so a decrypt/parse failure can
+        // never surface a password/code/secret fragment here even if
+        // Backend's own message text ever changed. See
+        // PanelLogic.degradedStateMessage()'s own docstring.
+        text: Logic.degradedStateMessage(root.state.loadErrorState, "list", root.state.loadErrorMessage)
+        color: root.urgent
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         wrapMode: Text.WordWrap
       }
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Close and reopen the panel to try again."
+        color: root.safeMuted
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+
+    Flickable {
+      id: flick
+      width: parent.width
+      height: Math.min(300, listCol.implicitHeight)
+      visible: root.state.loadState === "ok"
+      contentWidth: width
+      contentHeight: listCol.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
 
       Column {
-        width: parent.width
-        visible: root.state.loadState === "error"
-        spacing: 4
+        id: listCol
+        width: flick.width
 
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          // Names the fix, not the symptom (issue #6) -- mapped from the
-          // TYPED state Backend/Cli.js report (loadErrorState), never a raw
-          // Backend/Cli.js message string, so a decrypt/parse failure can
-          // never surface a password/code/secret fragment here even if
-          // Backend's own message text ever changed. See
-          // PanelLogic.degradedStateMessage()'s own docstring.
-          text: Logic.degradedStateMessage(root.state.loadErrorState, "list", root.state.loadErrorMessage)
-          color: root.urgent
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          wrapMode: Text.WordWrap
-        }
-
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: "Close and reopen the panel to try again."
-          color: root.safeMuted
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
-      }
-
-      Flickable {
-        id: flick
-        width: parent.width
-        height: Math.min(300, listCol.implicitHeight)
-        visible: root.state.loadState === "ok"
-        contentWidth: width
-        contentHeight: listCol.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-
-        Column {
-          id: listCol
-          width: flick.width
-
-          Repeater {
-            model: root.state.loadState === "ok" ? root.state.filteredEntries : []
-            delegate: TokenRow { width: listCol.width }
-          }
+        Repeater {
+          model: root.state.loadState === "ok" ? root.state.filteredEntries : []
+          delegate: TokenRow { width: listCol.width }
         }
       }
     }
