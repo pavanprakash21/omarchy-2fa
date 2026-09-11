@@ -52,12 +52,29 @@ command -v otpclient-cli >/dev/null || die "otpclient-cli not found. Install it 
 # back to disk -- writing 2FA secrets to an SSD is the thing this avoids.
 [ -d /dev/shm ] || die "/dev/shm not available; refusing to stage plaintext secrets on disk"
 
-STAGE="$(mktemp -d /dev/shm/ente-sync.XXXXXX)"
+# A FIXED path rather than a fresh mktemp dir each run: Ente stores the export
+# directory in its own config, so pointing it at a throwaway path would leave
+# that config dangling at a directory that no longer exists, and a later bare
+# `ente export` would fail confusingly. This path is the one configured at
+# `ente account add` time, so the config stays valid between runs.
+#
+# It still lives in /dev/shm, so it evaporates on reboot -- hence the mkdir
+# below, which recreates it rather than assuming it survived.
+STAGE="${ENTE_EXPORT_DIR:-/dev/shm/ente-auth-export}"
+
+case "$STAGE" in
+  /dev/shm/*) ;;
+  *) die "Export dir '$STAGE' is not under /dev/shm; refusing to stage plaintext secrets on disk" ;;
+esac
+
+mkdir -p -m 700 "$STAGE"
+chmod 700 "$STAGE"
+
 cleanup() {
-  # shred each file, then drop the dir. Runs on success, failure and Ctrl-C.
+  # Shred the exported secrets but KEEP the directory, so Ente's stored config
+  # still points somewhere real. Runs on success, failure and Ctrl-C.
   if [ -d "$STAGE" ]; then
     find "$STAGE" -type f -exec shred -u {} + 2>/dev/null || true
-    rm -rf "$STAGE"
   fi
 }
 trap cleanup EXIT INT TERM
@@ -68,6 +85,7 @@ if [ -z "$EMAIL" ]; then
 fi
 [ -n "$EMAIL" ] || die "Could not determine your Ente account. Set ENTE_EMAIL=you@example.com and retry."
 
+find "$STAGE" -type f -exec shred -u {} + 2>/dev/null || true
 say "Exporting from Ente into RAM ($STAGE)..."
 ente account update --app auth --email "$EMAIL" --dir "$STAGE" >/dev/null
 ente export >/dev/null
