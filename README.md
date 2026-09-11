@@ -167,6 +167,31 @@ second activation before any HOTP-shaped counter is ever allowed to
 advance. This is deliberate: a setting must never be able to fail-open the
 one gate standing between a click and an irreversible counter advance.
 
+## Syncing from Ente Auth
+
+OTPClient has no sync of its own. If you keep your tokens in [Ente
+Auth](https://ente.io/auth/) — end-to-end encrypted, and the practical way to
+have the same vault on a phone and a desktop — `contrib/ente-sync.sh` refreshes
+the OTPClient database from it, and therefore this widget:
+
+```
+yay -S ente-cli-bin
+ente account add          # choose "auth" as the app
+./contrib/ente-sync.sh
+```
+
+Run it after adding or removing a token in Ente. It is deliberately a command
+you run, not a daemon — a background job holding your whole 2FA vault open on a
+timer is a worse trade than typing one command occasionally. Re-running it is
+safe: `otpclient-cli` detects and skips duplicates.
+
+One thing the script exists to handle: **Ente's export writes every secret in
+plaintext.** The script points Ente's export directory at `/dev/shm` (RAM),
+mode 0700, and shreds it on the way out — including on Ctrl-C — so nothing
+unencrypted is ever written to your SSD. If you export from the Ente GUI
+instead, it lands plaintext in `~/Downloads`; shred it promptly, or prefer the
+GUI's encrypted export.
+
 ## Security
 
 - **In memory:** never more than one decrypted code at a time, and only for
