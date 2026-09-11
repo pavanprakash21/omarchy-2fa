@@ -77,6 +77,20 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable pavanprakash21.twofa
 ```
 
+### Updating
+
+```
+omarchy plugin update pavanprakash21.twofa
+omarchy restart shell
+```
+
+**The restart is required, not optional.** `omarchy plugin update` pulls the new
+files, but the running shell has already compiled and cached the old QML, so a
+plain update leaves you running the previous version with no indication that
+anything is stale. `omarchy-shell shell rescanPlugins` re-reads manifests and is
+not enough on its own either. Use `omarchy restart shell` (it handles restarting
+safely while a lock client is live, which a raw `kill` does not).
+
 ## Use
 
 - Click the shield icon in the bar to open the panel.
