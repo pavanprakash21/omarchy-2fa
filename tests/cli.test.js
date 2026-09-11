@@ -392,10 +392,76 @@ test("isInstanceConflictStderr does not false-positive on an unrelated stderr li
   assert(!Cli.isInstanceConflictStderr(""));
 });
 
+// ---- issue #25: a SECOND confirmed real-world instance-conflict stderr
+// shape, for the exact same root cause (otpclient-cli <= 5.1.6 registering
+// the GUI's own D-Bus application id -- see Cli.js's ISSUE #25 note). The
+// original isInstanceConflictStderr() only matched the org.gtk.Actions/
+// UnknownMethod signature above, so a live run hitting THIS signature fell
+// through to "malformed" instead -- the actual bug issue #25 reports.
+// Reverting isInstanceConflictStderr()'s fix should turn exactly these new
+// assertions red, not the ones above (which cover the original signature).
+
+test("isInstanceConflictStderr also matches the second confirmed signature (NotSupported/does-not-handle-command-line-arguments)", () => {
+  const err = "GDBus.Error:org.freedesktop.DBus.Error.NotSupported: Application does not handle command line arguments";
+  assert(Cli.isInstanceConflictStderr(err));
+});
+
+test("isInstanceConflictStderr matches a plausible third variant via the general GDBus.Error + OTPClient app-id shape", () => {
+  const err = "Some other wrapper text: GDBus.Error:org.freedesktop.DBus.Error.Failed: com.github.paolostivanin.OTPClient could not be reached";
+  assert(Cli.isInstanceConflictStderr(err));
+});
+
+test("isInstanceConflictStderr still requires GDBus.Error -- 'does not handle command line arguments' alone is not enough", () => {
+  assert(!Cli.isInstanceConflictStderr("Application does not handle command line arguments"));
+});
+
 test("classify() routes the D-Bus collision to instance-conflict, not malformed", () => {
   const err = 'Failed to register: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: No such interface "org.gtk.Actions" on object at path /com/github/paolostivanin/OTPClient';
   const r = Cli.classify(1, "", err, "list");
   assertEqual(r.state, "instance-conflict");
+});
+
+test("classify() routes the SECOND confirmed signature to instance-conflict too, not malformed (issue #25's actual bug)", () => {
+  const err = "GDBus.Error:org.freedesktop.DBus.Error.NotSupported: Application does not handle command line arguments";
+  const r = Cli.classify(1, "", err, "list");
+  assertEqual(r.state, "instance-conflict");
+  assert(r.state !== "malformed");
+});
+
+test("classify() instance-conflict message does not claim the condition is transient -- it's an upstream bug that doesn't clear on its own (issue #25)", () => {
+  const err = "GDBus.Error:org.freedesktop.DBus.Error.NotSupported: Application does not handle command line arguments";
+  const r = Cli.classify(1, "", err, "list");
+  assert(!/try again/i.test(r.message), "must not say 'try again' -- waiting never helps on an affected version");
+});
+
+// ---- issue #24: no-database (no db configured at all) vs would-prompt
+// (db exists, Secret Service off) must be DISTINCT states with DISTINCT
+// messages, both reachable deterministically (not just guessed from a
+// timeout) now that stdin is closed before every invocation. Reverting
+// EITHER new classify() branch below should turn exactly its own
+// assertions red -- these two fixtures/tests are deliberately isolated so
+// a regression in one can't hide behind the other passing.
+
+test("'Couldn't get db path from stdin' -> no-database, NOT would-prompt/db-missing (issue #24)", () => {
+  const r = Cli.classify(255, "", "Type the absolute path to the database: Couldn't get db path from stdin\n", "list");
+  assertEqual(r.state, "no-database");
+});
+
+test("no-database is also matched off stdout, since the exact stream this interactive prompt lands on was not independently confirmed", () => {
+  const r = Cli.classify(255, "Type the absolute path to the database: Couldn't get db path from stdin\n", "", "list");
+  assertEqual(r.state, "no-database");
+});
+
+test("'Empty password not allowed' / 'No password provided, exiting.' -> would-prompt, NOT no-database (issue #24)", () => {
+  const r = Cli.classify(255, "", "Empty password not allowed\nNo password provided, exiting.\n", "list");
+  assertEqual(r.state, "would-prompt");
+});
+
+test("no-database and would-prompt render DISTINCT messages -- collapsing them back into one guessed state is the original issue #24 bug", () => {
+  const noDb = Cli.classify(255, "", "Type the absolute path to the database: Couldn't get db path from stdin\n", "list");
+  const wouldPrompt = Cli.classify(255, "", "Empty password not allowed\nNo password provided, exiting.\n", "list");
+  assert(noDb.state !== wouldPrompt.state, "states must differ");
+  assert(noDb.message !== wouldPrompt.message, "messages must differ");
 });
 
 test("unparseable stdout with no recognized stderr -> malformed, never throws", () => {
@@ -406,6 +472,33 @@ test("unparseable stdout with no recognized stderr -> malformed, never throws", 
 test("classify never throws on totally empty input", () => {
   const r = Cli.classify(1, "", "", "show");
   assertEqual(r.state, "malformed");
+});
+
+// ---- issue #24: stdin is actually closed for every invocation -----------
+// A plain source-text check (see tests/backend.qmltest.qml's
+// "stdin-closed" scenarios for the real-Process-level proof that this
+// actually results in an immediate EOF, not just that these two lines
+// exist) -- catches an accidental revert of either half of the two-place
+// toggle _spawn()'s own docstring explains is required on this Quickshell
+// version (stdinEnabled = true before `running = true`, then back to
+// false from EACH Process's onRunningChanged once running actually flips).
+test("Backend.qml's _spawn() enables stdin before every run (issue #24)", () => {
+  const backendPath = path.join(__dirname, "..", "Backend.qml");
+  const backendSrc = fs.readFileSync(backendPath, "utf8");
+  const spawnFn = backendSrc.match(/function _spawn\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+  assert(spawnFn, "could not find Backend.qml's _spawn() function");
+  assert(/proc\.stdinEnabled\s*=\s*true/.test(spawnFn[0]),
+    "_spawn() must set proc.stdinEnabled = true before running = true");
+});
+
+test("Backend.qml closes stdin for BOTH listProc and showProc once running actually starts (issue #24)", () => {
+  const backendPath = path.join(__dirname, "..", "Backend.qml");
+  const backendSrc = fs.readFileSync(backendPath, "utf8");
+  const closeCalls = backendSrc.match(/\w+\.stdinEnabled\s*=\s*false/g) || [];
+  assert(closeCalls.length >= 2,
+    "expected at least 2 sites setting stdinEnabled = false (listProc's and showProc's onRunningChanged), found " + closeCalls.length);
+  assert(/listProc\.stdinEnabled\s*=\s*false/.test(backendSrc), "listProc must close its own stdin");
+  assert(/showProc\.stdinEnabled\s*=\s*false/.test(backendSrc), "showProc must close its own stdin");
 });
 
 // ---- issue #22: no untrusted (issuer/account) content reaches a log sink --

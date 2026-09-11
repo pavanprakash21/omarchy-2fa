@@ -47,11 +47,21 @@ for what's still ahead.
 - **Secret Service enabled in OTPClient.** Open OTPClient's own preferences
   and turn on "Use Secret Service integration", then unlock your database
   once so the password is stored in your keyring. Without this,
-  `otpclient-cli` blocks on a stdin password prompt this panel cannot
-  answer, and every reveal ends up in the `would-prompt` state instead of a
-  code — **this is the single most common first-run problem**; see
-  [If something's not working](#if-somethings-not-working) below.
+  `otpclient-cli` cannot obtain a password non-interactively, and every
+  reveal ends up in the `would-prompt` state instead of a code — **this is
+  the single most common first-run problem**; see
+  [If something's not working](#if-somethings-not-working) below. (This is
+  now a distinct state from having no database configured at all, which
+  gets its own message pointing at creating one — the two used to be
+  indistinguishable here.)
 - `wl-clipboard` (`wl-copy`/`wl-paste`) for the clipboard copy.
+
+> **2026-09-11:** the AUR `otpclient` package is currently pinned to 5.1.6
+> and itself flagged out-of-date. On 5.1.6, `otpclient-cli` cannot run at
+> all while the OTPClient GUI is open — a real upstream bug (the CLI
+> registers the GUI's own D-Bus application id), fixed in commit
+> `7a9671e1` but not yet in a tagged release. Closing the GUI works around
+> it today; `otpclient-git` builds from `master` and already has the fix.
 
 ## Install
 
@@ -188,13 +198,14 @@ database secret in the text:
 | What you'll see | What it means | The fix |
 |---|---|---|
 | "otpclient isn't installed…" | `otpclient-cli` isn't at `/usr/bin` or `/usr/local/bin` (checked directly; no PATH lookup, per this plugin's own threat model — see issue #21) | `otpclient` is AUR-only: `yay -S otpclient`, which installs to `/usr/bin` |
-| "Secret Service integration is off…" | otpclient-cli is blocked on a password prompt this panel can't answer — the most likely first-run state | Enable "Use Secret Service" in OTPClient's own preferences |
+| "Secret Service integration is off…" | otpclient-cli couldn't obtain a database password non-interactively — the most likely first-run state, given a database is configured | Enable "Use Secret Service" in OTPClient's own preferences |
+| "No OTPClient database is configured yet…" | Nothing configured at all — no `-d`/`--database`, no default in GSettings | Create a database in the OTPClient GUI (or `otpclient-cli --import`) |
 | "password… is stale or wrong" | The keyring entry needs refreshing | Unlock the database once in the OTPClient GUI |
-| "No OTPClient database found…" | Nothing configured at the expected path | Set one up in the OTPClient GUI, or check `~/.config/otpclient/otpclient.cfg` |
+| "No OTPClient database found…" | A database *is* configured, but nothing exists at that path | Set one up in the OTPClient GUI, or check `~/.config/otpclient/otpclient.cfg` |
 | "returned output this panel could not understand" | A decrypt/parse failure | Reported as-is; no automatic repair is attempted |
 | "No entries in your OTPClient database." | An empty, valid database | Not an error — add tokens in the OTPClient GUI |
 | "otpclient-cli crashed" | otpclient-cli itself died to a signal | Likely a bug in otpclient-cli or a damaged database, not a config problem here |
-| "another OTPClient process already has the database open" | A GLib D-Bus single-instance race — most commonly the OTPClient GUI being open | Close the other instance and try again |
+| "otpclient-cli can't run because the OTPClient GUI is open" | A GLib D-Bus single-instance bug in otpclient-cli <= 5.1.6 (see the dated note under [Requirements](#requirements)) — this does not clear on its own | Close the OTPClient GUI, or switch to `otpclient-git` |
 
 The widget installs and enables cleanly even with `otpclient` not installed
 at all — every case above is a degraded, in-panel state, never a crash or a

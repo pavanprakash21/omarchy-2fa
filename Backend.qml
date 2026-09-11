@@ -29,10 +29,14 @@ import "Shared.js" as Shared
 // - The binary path is resolved from a fixed candidate list and cached; the
 //   resolved path is what's used in every subsequent `command` array, never
 //   an issuer/account.
-// - Every invocation is wrapped in `/usr/bin/timeout -s KILL <n>` (OS-level
-//   deadline) *and* guarded by a QML Timer watchdog (deadline+2s, belt and
-//   suspenders) so a CLI blocked on a stdin password prompt surfaces as the
-//   typed `would-prompt` state instead of hanging the shell. This mirrors
+// - Every invocation's stdin is explicitly closed (issue #24 -- see
+//   _spawn() and each Process's onRunningChanged below) so a CLI that would
+//   otherwise block reading a database-path or password prompt fails fast
+//   and deterministically instead. `/usr/bin/timeout -s KILL <n>` (OS-level
+//   deadline) *and* a QML Timer watchdog (deadline+2s, belt and suspenders)
+//   remain as a backstop for a GENUINE hang (e.g. Secret Service present
+//   but D-Bus itself wedged) -- see _handleExit()'s docstring for why
+//   that's no longer the primary signal for `would-prompt`. This mirrors
 //   the discipline in ~/.config/omarchy/plugins/zeru.portwatch/Widget.qml.
 // - A decrypted code (or anything else a process printed) is never retained
 //   longer than the single signal emission that hands it to the caller.
@@ -51,25 +55,32 @@ import "Shared.js" as Shared
 //   what this does and doesn't protect against.
 //
 // PRECONDITION (discovered, not otherwise documented in issue #2; UPDATED
-// for issue #17): the argv this file builds includes -d/--database ONLY
-// when `database` below is non-empty -- see that property's own doc
-// comment and Cli.js's _withDatabase(). With `database` left at its default
-// ("", unset), this is unchanged from the original issue #2 contract:
-// `otpclient-cli --help` says -d "Default value is taken from
-// GSettings/otpclient.cfg" -- confirmed: on a machine with no such default
-// set (e.g. otpclient-cli never configured via the GUI, as on the machine
-// this was developed on), --list with no -d prompts *interactively for a
-// database path* ("Type the absolute path to the database:") over stdin,
-// which hangs exactly like the password prompt under the same conditions
-// and is caught the same way, landing in `would-prompt`. In other words:
-// a user who leaves `database` unset still needs OTPClient set up with a
-// default database (GUI or `otpclient-cli --import`, which registers one)
-// -- a perfectly reasonable assumption for this plugin's premise, but worth
-// confirming with whoever owns settings/onboarding for this plugin, since
-// "no default database configured yet" is indistinguishable here from
-// "Secret Service is off", both being would-prompt. Setting `database`
-// explicitly sidesteps this precondition entirely, since -d is then always
-// present and otpclient-cli never falls back to the interactive prompt.
+// for issue #17, and again for issue #24): the argv this file builds
+// includes -d/--database ONLY when `database` below is non-empty -- see
+// that property's own doc comment and Cli.js's _withDatabase(). With
+// `database` left at its default ("", unset), this is unchanged from the
+// original issue #2 contract: `otpclient-cli --help` says -d "Default
+// value is taken from GSettings/otpclient.cfg" -- confirmed: on a machine
+// with no such default set (e.g. otpclient-cli never configured via the
+// GUI), --list with no -d prompts *interactively for a database path*
+// ("Type the absolute path to the database:") over stdin. A user who
+// leaves `database` unset still needs OTPClient set up with a default
+// database (GUI or `otpclient-cli --import`, which registers one) -- a
+// perfectly reasonable assumption for this plugin's premise.
+//
+// ISSUE #24 UPDATE: that database-path prompt USED TO be indistinguishable
+// from "Secret Service is off" -- both left the child blocked reading
+// stdin, both were only ever noticed via the 4s timeout, and both got
+// reported as the same guessed `would-prompt` state (a live, confirmed
+// misdiagnosis: a machine with no database configured at all was told to
+// go check Secret Service, which would have fixed nothing). Every spawn
+// now explicitly closes the child's stdin instead (see _spawn() and each
+// Process's onRunningChanged below) -- verified against a real
+// otpclient-cli 5.1.6, this makes BOTH prompts fail immediately with
+// distinct stderr text instead of hanging, which is what lets Cli.js's
+// classify() tell them apart deterministically as `no-database` and
+// `would-prompt` respectively, rather than guessing from a timeout. See
+// Cli.js's STDIN CLOSURE note for the exact verified transcripts.
 //
 // THE DATABASE LOCK FILE (corrected after adversarial review -- the
 // original comment here was wrong): otpclient-cli creates a `<name>.lock`
@@ -177,11 +188,15 @@ Item {
   // Emitted after a successful --list with at least one entry.
   signal listSucceeded(var entries)
   // Emitted for every non-"ok" --list outcome. `state` is one of:
-  // binary-missing, would-prompt, bad-password, db-missing, malformed,
-  // empty, crashed, instance-conflict. The last two were added after
-  // adversarial review found real scenarios the original 7-state list from
-  // issue #2 didn't distinguish -- see _handleExit()'s docstring and
-  // Cli.js's isInstanceConflictStderr().
+  // binary-missing, would-prompt, bad-password, db-missing, no-database,
+  // malformed, empty, crashed, instance-conflict. `crashed`/
+  // `instance-conflict` were added after adversarial review found real
+  // scenarios the original 7-state list from issue #2 didn't distinguish
+  // -- see _handleExit()'s docstring and Cli.js's isInstanceConflictStderr().
+  // `no-database` was added for issue #24: a live misdiagnosis found "no
+  // database configured at all" and "database exists, Secret Service off"
+  // were both being collapsed into `would-prompt` -- see the PRECONDITION
+  // note above and Cli.js's classify().
   signal listFailed(string state, string message)
 
   // Emitted after a successful --show (TOTP via requestCode(), or HOTP via
@@ -193,7 +208,7 @@ Item {
   // call already advanced and persisted it. `entry` is handed to this
   // signal and then never retained anywhere in this file.
   signal showSucceeded(string issuer, string account, var entry)
-  // Emitted for every non-"ok" --show outcome, same eight `state` values
+  // Emitted for every non-"ok" --show outcome, same nine `state` values
   // documented on listFailed above.
   signal showFailed(string issuer, string account, string state, string message)
 
@@ -322,11 +337,38 @@ Item {
     root._spawn(proc, candidate, argvTail)
   }
 
+  // ISSUE #24: `stdinEnabled = true` here, THEN `false` in the Process's own
+  // onRunningChanged (below) once `running` actually flips -- in that
+  // order, on this exact Quickshell version. This was verified empirically
+  // (see the PR description for the harness), not assumed from
+  // documentation, because the documented and observed behaviors disagree:
+  //   - Leaving stdinEnabled false the whole time (the old behavior here,
+  //     and this property's own documented default) does NOT close the
+  //     child's stdin -- it leaves an open, silent pipe, and a child
+  //     reading from it (otpclient-cli's database-path or password prompt)
+  //     blocks for real, confirmed against both a `cat` stand-in and the
+  //     real otpclient-cli.
+  //   - Toggling true -> false synchronously, in the same tick as setting
+  //     `running = true`, does NOT close it either -- confirmed the same
+  //     way, and the child still hangs.
+  //   - Toggling true -> false from INSIDE onRunningChanged, after `running`
+  //     has already become true, DOES close it: the child gets immediate
+  //     EOF on stdin (confirmed: a `cat` reading it exits instantly instead
+  //     of needing `-s KILL`; the real otpclient-cli against a
+  //     Secret-Service-off database returned in single-digit milliseconds
+  //     with "Empty password not allowed"/"No password provided, exiting."
+  //     instead of waiting out the 4s timeout). This is also why the toggle
+  //     is split across two places instead of being one call here: setting
+  //     it back to true before every spawn matters too, since listProc/
+  //     showProc are long-lived and reused for every call, and this
+  //     Quickshell version does not reopen a channel by re-enabling it
+  //     without a fresh `running` transition in between.
   function _spawn(proc, candidate, argvTail) {
     proc.command = Cli.isPathLookupCandidate(candidate)
       ? Cli.wrapViaPath(candidate, argvTail, root.timeoutMs)
       : Cli.wrap(candidate, argvTail, root.timeoutMs)
     proc._startedAt = Date.now()
+    proc.stdinEnabled = true
     proc.running = true
   }
 
@@ -416,6 +458,19 @@ Item {
   // instead -- not would-prompt, and not silently folded into `malformed`
   // either, since "the process died to a signal" is meaningfully different
   // information from "we couldn't parse its output".
+  //
+  // ISSUE #24: this CrashExit/timeout path used to be the ONLY way either
+  // prompt-blocked case ever got reported, which is exactly why "no
+  // database configured" and "Secret Service off" used to be
+  // indistinguishable (both just "the process never came back"). Now that
+  // every spawn closes stdin (see _spawn()), both of those prompts fail
+  // immediately and are classified deterministically by Cli.js's
+  // classify() from stderr text (`no-database` / `would-prompt`) well
+  // before this timeout path would ever fire. This path remains reachable
+  // -- and still reports `would-prompt` when corroborated -- only for a
+  // GENUINE hang unrelated to either prompt (e.g. Secret Service present
+  // but its D-Bus service itself wedged): a backstop, not the primary
+  // signal it used to be.
   function _handleExit(proc, exitCode, exitStatus, kind) {
     if (proc._finished) return // watchdog already resolved this attempt
 
@@ -560,8 +615,12 @@ Item {
     property var _stderr: null
 
     onRunningChanged: {
-      if (running) listWatchdog.restart()
-      else listWatchdog.stop()
+      if (running) {
+        listProc.stdinEnabled = false // issue #24 -- see _spawn()'s docstring for why this has to happen here, not in _spawn() itself
+        listWatchdog.restart()
+      } else {
+        listWatchdog.stop()
+      }
     }
     onExited: function (exitCode, exitStatus) {
       root._handleExit(listProc, exitCode, exitStatus, "list")
@@ -581,8 +640,12 @@ Item {
     property var _stderr: null
 
     onRunningChanged: {
-      if (running) showWatchdog.restart()
-      else showWatchdog.stop()
+      if (running) {
+        showProc.stdinEnabled = false // issue #24 -- see _spawn()'s docstring for why this has to happen here, not in _spawn() itself
+        showWatchdog.restart()
+      } else {
+        showWatchdog.stop()
+      }
     }
     onExited: function (exitCode, exitStatus) {
       root._handleExit(showProc, exitCode, exitStatus, "show")
