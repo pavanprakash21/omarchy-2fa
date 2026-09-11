@@ -15,7 +15,10 @@
 # this way. In particular, panel.qmltest.qml never instantiates Popup.qml
 # (the actual PopupWindow) -- PanelState.qml is a plain Item, so this run
 # never maps a window on screen even though it executes under a real,
-# live Quickshell/Wayland connection.
+# live Quickshell/Wayland connection. widget-dock.qmltest.qml does
+# instantiate the real Widget.qml (and therefore its Popup child), but never
+# calls open()/toggle() on it, so that Popup's `open` stays false and it is
+# never shown either -- see that file's own header.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,9 +39,26 @@ trap cleanup EXIT
 
 cp "$REPO/Backend.qml" "$REPO/Cli.js" "$REPO/Shared.js" \
    "$REPO/PanelState.qml" "$REPO/PanelLogic.js" \
+   "$REPO/Widget.qml" "$REPO/Popup.qml" \
    "$DIR"/*.qmltest.qml \
    "$WORKDIR/"
 cp -r "$DIR/fixtures" "$WORKDIR/fixtures"
+
+# widget-dock.qmltest.qml (issue #7) instantiates the real Widget.qml, which
+# imports qs.Ui/qs.Commons. Quickshell resolves those against the launched
+# file's own directory, not some fixed shell root (verified empirically:
+# `import qs.Ui` from a config at /a/b/c.qml looks for a sibling /a/b/Ui) --
+# so stage read-only copies of the real omarchy shell's Ui/ and Commons/
+# modules next to it. This reads the OS package at /usr/share/omarchy/shell,
+# never the user's own ~/.config; if it isn't installed (e.g. a bare CI box),
+# skip that one test rather than failing the whole run.
+OMARCHY_SHELL="/usr/share/omarchy/shell"
+HAVE_DOCK_TEST_DEPS=0
+if [ -d "$OMARCHY_SHELL/Ui" ] && [ -d "$OMARCHY_SHELL/Commons" ]; then
+  cp -r "$OMARCHY_SHELL/Ui" "$WORKDIR/Ui"
+  cp -r "$OMARCHY_SHELL/Commons" "$WORKDIR/Commons"
+  HAVE_DOCK_TEST_DEPS=1
+fi
 
 # The path-lookup scenario (adversarial review item #6: fall back to PATH
 # when the fixed absolute candidates aren't found) needs a real executable
@@ -109,5 +129,14 @@ run_one "backend.qmltest.qml" 25 || OVERALL=1
 # clipboard-clear) on top of several sequential list/show round trips;
 # 40s leaves generous headroom over its ~9s typical wall time.
 run_one "panel.qmltest.qml" 40 || OVERALL=1
+
+# widget-dock.qmltest.qml (issue #7): loads the real Widget.qml once and
+# runs a handful of synchronous property checks against a simulated
+# dockBarContext -- no timers, no processes. 20s is generous.
+if [ "$HAVE_DOCK_TEST_DEPS" = "1" ]; then
+  run_one "widget-dock.qmltest.qml" 20 || OVERALL=1
+else
+  echo "SKIP widget-dock.qmltest.qml -- $OMARCHY_SHELL/{Ui,Commons} not found" >&2
+fi
 
 exit $OVERALL
